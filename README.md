@@ -25,7 +25,7 @@ install.packages(c("Seurat", "RcppML", "msigdbr"))
 # remotes::install_github("chuiqin/irGSEA")
 
 # then install this package
-# remotes::install_local("StateCommute")
+# remotes::install_github("YU-LIN96/StateCommute")
 ```
 
 ## Pipeline
