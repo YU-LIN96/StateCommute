@@ -1,0 +1,268 @@
+---
+title: "StateCommute: from pathway scores to per-state representative pathways"
+author: "StateCommute"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{StateCommute walkthrough}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.width = 6,
+  fig.height = 4
+)
+library(StateCommute)
+```
+
+## Overview
+
+StateCommute characterizes disease-associated cell states at the **pathway**
+level. The workflow has two complementary halves that meet at a bridge:
+
+1. **Cell side (needs a Seurat object).** Score gene sets per cell with irGSEA
+   (AUCell), factorize the resulting pathway × cell matrix with NMF to recover
+   functional modules, and cluster cells into states.
+2. **Gene side (pure gene-set math).** Collapse redundant pathways by gene-set
+   overlap similarity and pick one representative per redundancy group.
+
+The two grouping logics are different on purpose. **NMF groups pathways by how
+they co-vary across cells; overlap reduction groups them by shared genes.** The
+bridge, `reduce_pathways_for_states()`, runs the overlap reduction *within* each
+state's NMF-selected pathways, using the NMF loading as the tie-breaker for which
+pathway represents the group.
+
+This vignette shows the cell-side stages as (non-evaluated) code you would run on
+your own data, then demonstrates the gene-side reduction engine on a small
+simulated gene-set collection so every step below actually runs.
+
+## Part 1 — Cell side (on your Seurat object)
+
+These stages require a Seurat object plus `irGSEA`, `RcppML`, `msigdbr` and
+`Seurat`. They are shown for reference and are not evaluated here.
+
+### Gene sets
+
+```{r genesets, eval = FALSE}
+gs <- prepare_genesets_msigdb(
+  species    = "mouse",
+  db_species = "MM"
+  # default specs: MH, M2:CP:REACTOME, M2:CP:WIKIPATHWAYS, M7, M5:GO:BP (size 20-200)
+)
+
+# Object-aware: keep only genes present in the data, then a size floor.
+gs <- filter_genesets_to_features(gs, rownames(obj[["RNA"]]))
+gs <- standardize_genesets(gs, min_geneset_size = 5)
+```
+
+### Scoring and NMF
+
+Only AUCell is used downstream because NMF needs a non-negative matrix.
+
+```{r scoring-nmf, eval = FALSE}
+obj <- score_pathways_irgsea(obj, gs, methods = "AUCell", ncores = 12)
+
+mat <- get_pathway_cell_matrix(obj)     # pathways x cells (AUCell)
+nm  <- run_nmf(mat, k = 20, seed = 1234)
+obj <- embed_nmf(obj, nm)               # adds an "nmf" DimReduc
+```
+
+### Clustering and (optional) QC
+
+```{r cluster-qc, eval = FALSE}
+obj <- cluster_states(obj, resolution = 0.3)   # SNN on NMF + nmf_umap
+
+# Optional ambient-contamination QC (DecontX score + neuronal marker):
+obj <- flag_contamination(obj)                 # adds con_level / qc_flag
+obj <- filter_contaminated(obj)                # then re-run NMF on the clean object
+```
+
+### Interpreting the modules
+
+```{r nmf-interp, eval = FALSE}
+tops <- nmf_top_pathways(nm, n = 30)                 # top pathways per factor
+fbs  <- nmf_factor_by_state(obj, "state_anno2")      # factor x state mean loading
+```
+
+## Part 2 — The reduction engine (runnable)
+
+Here we switch to simulated gene sets so the rest of the vignette executes with
+only the CRAN dependencies. We build three redundancy "families" (A/B/C) that
+each share a core gene set, plus one distinct set.
+
+```{r simulate}
+set.seed(1)
+pool   <- paste0("g", 1:60)
+core_A <- sample(pool, 8)
+core_B <- sample(pool, 8)
+core_C <- sample(pool, 8)
+mk <- function(core, extra) unique(c(core, sample(pool, extra)))
+
+genesets <- list(
+  A1 = mk(core_A, 2), A2 = mk(core_A, 3), A3 = mk(core_A, 2),
+  B1 = mk(core_B, 2), B2 = mk(core_B, 3), B3 = mk(core_B, 4),
+  C1 = mk(core_C, 2), C2 = mk(core_C, 3),
+  D1 = sample(pool, 10)
+)
+lengths(genesets)
+```
+
+### Collapse redundancy
+
+`reduce_pathway_terms()` runs the whole standardize → similarity → group →
+represent pipeline. With the overlap coefficient and a 0.5 threshold, the A/B/C
+families should each collapse to a single representative while D1 stands alone.
+
+```{r reduce}
+res <- reduce_pathway_terms(
+  genesets,
+  similarity_method    = "overlap",
+  reduction_method     = "hclust",
+  similarity_threshold = 0.5,
+  representative_rule  = "largest_geneset"
+)
+
+res$selected_terms
+```
+
+```{r reduce-table}
+res$representative_table[, c("representative_term", "group_id",
+                             "n_terms_in_group", "geneset_size")]
+```
+
+The `member_terms` column records which original pathways fell into each group:
+
+```{r members}
+setNames(res$representative_table$member_terms,
+         res$representative_table$representative_term)
+```
+
+### Choosing representatives by an external score
+
+This is exactly what the bridge does per state: instead of picking the largest
+gene set, it supplies the NMF loading as a priority so the pathway with the
+highest loading in that state wins its group. Here we mimic it with an arbitrary
+priority vector via `representative_rule = "user_priority"`.
+
+```{r priority}
+# Pretend these are NMF loadings; A2 and B1 are favoured within their families.
+priority <- c(A1 = 0.2, A2 = 0.9, A3 = 0.3,
+              B1 = 0.8, B2 = 0.4, B3 = 0.5,
+              C1 = 0.6, C2 = 0.7, D1 = 0.5)
+
+res_prio <- reduce_pathway_terms(
+  genesets,
+  similarity_method    = "overlap",
+  similarity_threshold = 0.5,
+  representative_rule  = "user_priority",
+  term_priority        = priority
+)
+res_prio$selected_terms   # A2 and B1 now represent their families
+```
+
+## Part 3 — Diagnostics and plots
+
+### Threshold sensitivity
+
+How many representatives survive as the threshold varies:
+
+```{r sensitivity, fig.alt = "Number of retained representative terms across similarity thresholds"}
+plot_reduction_sensitivity(
+  genesets,
+  thresholds        = seq(0.3, 0.9, by = 0.1),
+  similarity_method = "overlap",
+  reduction_method  = "hclust"
+)
+```
+
+### Group-size distribution
+
+```{r group-size, fig.alt = "Histogram of redundancy group sizes"}
+plot_group_size_distribution(res)
+```
+
+### Similarity heatmap
+
+Uses ComplexHeatmap or pheatmap when installed, otherwise a base heatmap.
+
+```{r heatmap, fig.alt = "Pairwise gene-set similarity heatmap"}
+plot_similarity_heatmap(res, max_terms = 50)
+```
+
+### Dendrogram with the cut height
+
+Only meaningful for `reduction_method = "hclust"`; shown when `ggdendro` is
+available.
+
+```{r dendro, eval = requireNamespace("ggdendro", quietly = TRUE), fig.alt = "Redundancy dendrogram with threshold cut line"}
+plot_dendrogram_cutoff(res)
+```
+
+### Graph mode
+
+The graph reduction connects terms whose similarity exceeds the threshold and
+takes connected components (or Louvain communities).
+
+```{r graph, fig.alt = "Redundancy graph coloured by group"}
+res_g <- reduce_pathway_terms(
+  genesets,
+  similarity_method    = "overlap",
+  reduction_method     = "graph",
+  community_detection  = "components",
+  similarity_threshold = 0.5,
+  representative_rule  = "largest_geneset"
+)
+plot_redundancy_graph(res_g)
+```
+
+## Part 4 — The bridge (on your Seurat object)
+
+Once clusters are annotated into states (e.g. `obj$state_anno2`), the bridge
+assigns NMF factors to states, gathers each state's top-loading pathways, and
+reduces their gene-overlap redundancy — with the NMF loading picking each group's
+representative.
+
+```{r bridge, eval = FALSE}
+bridge <- reduce_pathways_for_states(
+  obj, genesets = gs, nmf_model = nm,
+  group.by = "state_anno2",
+  n_top    = 30,
+  assign   = "argmax",          # each factor -> its most-active state
+  similarity_method    = "overlap",
+  similarity_threshold = 0.7
+)
+
+bridge$representative_table                        # per-state representatives + loading
+plot_similarity_heatmap(bridge$results[["Antiviral"]])
+```
+
+Use `assign = "zscore"` instead if you want shared modules to contribute to
+several states (a factor whose z-score exceeds `zscore_thresh` in more than one
+state participates in each).
+
+## One-call orchestration
+
+`run_statecommute()` runs gene sets → scoring → NMF → clustering. Per-state
+reduction is only attempted when you pass a `state_col`, since annotation is a
+manual step in between.
+
+```{r pipeline, eval = FALSE}
+res_all <- run_statecommute(obj, k = 20, resolution = 0.3)
+# ... annotate res_all$object$state_anno2 ...
+bridge  <- reduce_pathways_for_states(
+  res_all$object, genesets = res_all$genesets,
+  nmf_model = res_all$nmf_model, group.by = "state_anno2"
+)
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

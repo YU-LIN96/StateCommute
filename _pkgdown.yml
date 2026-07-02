@@ -1,0 +1,55 @@
+url: https://YOUR_GH_USER.github.io/StateCommute/
+
+template:
+  bootstrap: 5
+
+navbar:
+  structure:
+    left:  [intro, reference, articles]
+    right: [search, github]
+
+reference:
+- title: "Gene sets"
+  contents:
+  - prepare_genesets_msigdb
+  - filter_genesets_to_features
+  - standardize_genesets
+- title: "Scoring"
+  contents:
+  - score_pathways_irgsea
+  - get_pathway_cell_matrix
+- title: "NMF"
+  contents:
+  - run_nmf
+  - embed_nmf
+  - nmf_top_pathways
+  - nmf_factor_by_state
+  - cluster_states
+- title: "QC"
+  contents:
+  - flag_contamination
+  - filter_contaminated
+- title: "Similarity & redundancy"
+  contents:
+  - build_geneset_sparse_matrix
+  - compute_similarity
+  - cluster_terms_hclust
+  - cluster_terms_graph
+  - choose_representative_terms
+- title: "Reduction"
+  contents:
+  - reduce_pathway_terms
+  - build_reduced_terms_simple
+  - reduce_pathways_for_states
+- title: "Visualization"
+  contents:
+  - plot_reduction_sensitivity
+  - plot_group_size_distribution
+  - plot_similarity_heatmap
+  - plot_dendrogram_cutoff
+  - plot_redundancy_graph
+  - plot_treemap_simple
+  - summarize_threshold_scan
+- title: "Pipeline"
+  contents:
+  - run_statecommute

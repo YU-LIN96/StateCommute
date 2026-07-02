@@ -1,0 +1,48 @@
+Package: StateCommute
+Type: Package
+Title: Pathway-Level Characterization of Cell States via irGSEA, NMF and Redundancy Reduction
+Version: 0.1.0
+Authors@R:
+    person("Yu", "L", email = "yl@example.com", role = c("aut", "cre"))
+Description: A workflow for characterizing disease-associated cell states at the
+    pathway level. It scores gene sets per cell with irGSEA (AUCell), factorizes
+    the resulting pathway x cell matrix with non-negative matrix factorization
+    (NMF) to recover functional modules, clusters cells into states, and collapses
+    redundant pathways per state by gene-set overlap similarity. A bridge function
+    links NMF modules to the overlap-based reduction, using NMF loadings to pick
+    representative pathways for each state.
+License: MIT + file LICENSE
+URL: https://github.com/YOUR_GH_USER/StateCommute,
+    https://YOUR_GH_USER.github.io/StateCommute/
+BugReports: https://github.com/YOUR_GH_USER/StateCommute/issues
+Remotes:
+    chuiqin/irGSEA
+Encoding: UTF-8
+LazyData: false
+RoxygenNote: 7.3.1
+Depends:
+    R (>= 4.1.0)
+Imports:
+    dplyr,
+    ggplot2,
+    grDevices,
+    igraph,
+    magrittr,
+    Matrix,
+    methods,
+    scales,
+    stats
+Suggests:
+    circlize,
+    ComplexHeatmap,
+    ggdendro,
+    irGSEA,
+    knitr,
+    msigdbr,
+    pheatmap,
+    RcppML,
+    rmarkdown,
+    Seurat,
+    treemap,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
