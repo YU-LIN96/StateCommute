@@ -8,6 +8,7 @@ clusters cells into **states**, and collapses **redundant pathways per state** b
 gene-set overlap similarity. A bridge function links the NMF modules to the
 overlap-based reduction, using NMF loadings to pick a representative pathway for
 each state.
+<img width="2752" height="1536" alt="Figure1" src="https://github.com/user-attachments/assets/8b9ed637-48d6-40e4-9611-c8eebfef06f3" />
 
 ## Installation
 
