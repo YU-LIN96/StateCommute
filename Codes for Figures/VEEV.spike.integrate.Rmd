@@ -1,0 +1,512 @@
+---
+title: "Untitled"
+author: "Yu"
+date: "2026-03-19"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+library(SeuratObject)
+library(ggplot2)
+library(dplyr)
+library(harmony)
+library(patchwork)
+library(future)
+library(SingleCellExperiment)
+
+set.seed(1234)
+```
+
+
+
+```{r load data}
+load("VEEV.check.objects.Rdata")
+load("merge_obj.after.QC.Rdata")
+```
+
+
+
+```{r simple filter to VEEV}
+
+colnames(VEEV_Mock_106d_spike.obj) <- paste(VEEV_Mock_106d_spike.obj$orig.ident,
+                                           colnames(VEEV_Mock_106d_spike.obj),sep = "_")
+
+colnames(VEEV_VEEV_106d_spike.obj) <- paste(VEEV_VEEV_106d_spike.obj$orig.ident,
+                                           colnames(VEEV_VEEV_106d_spike.obj),sep = "_")
+
+colnames(VEEV_Mock_7d_spike.obj) <- paste(VEEV_Mock_7d_spike.obj$orig.ident,
+                                           colnames(VEEV_Mock_7d_spike.obj),sep = "_")
+
+colnames(VEEV_VEEV_7d_spike.obj) <- paste(VEEV_VEEV_7d_spike.obj$orig.ident,
+                                           colnames(VEEV_VEEV_7d_spike.obj),sep = "_")
+
+VEEV.merge.spike.obj <- merge(VEEV_Mock_106d_spike.obj,
+                              c(VEEV_VEEV_106d_spike.obj,VEEV_Mock_7d_spike.obj,VEEV_VEEV_7d_spike.obj))
+
+VEEV.merge.spike.obj[["percent.mt"]] <- PercentageFeatureSet(VEEV.merge.spike.obj, pattern = "mt-")
+VEEV.merge.spike.obj <- subset(VEEV.merge.spike.obj, subset = nFeature_RNA > 200)
+```
+
+```{r remove the without spike veev}
+merge_obj <- subset(merge_obj, subset = !orig.ident %in% c("VEEV_Mock_106d","VEEV_VEEV_106d",
+                                                                     "VEEV_Mock_7d","VEEV_VEEV_7d"))
+
+```
+
+
+
+```{r merge into new}
+new_merge_obj <- merge(merge_obj,VEEV.merge.spike.obj)
+```
+
+
+```{r}
+new_merge_obj <- JoinLayers(new_merge_obj, assay = "RNA")
+new_merge_obj <- subset(new_merge_obj, subset = percent.mt <10)
+```
+
+
+```{r}
+save(new_merge_obj, file = "new_merge_obj.filter.qc.Rdata")
+```
+
+
+
+
+```{r sample list}
+sample.list <- SplitObject(new_merge_obj, split.by = "orig.ident")
+```
+
+
+```{r}
+library(decontX)
+```
+
+```{r}
+sample.list <- lapply(sample.list, function(obj) {
+  
+  sample_name <- unique(obj$orig.ident)
+  message("Running DecontX for: ", sample_name)
+  
+  # convert Seurat to SingleCellExperiment
+  sce <- as.SingleCellExperiment(obj, assay = "RNA")
+  
+  # run DecontX
+  sce <- decontX(sce)
+  
+  # add contamination score back to Seurat metadata
+  obj$decontX_contamination <- colData(sce)$decontX_contamination
+  
+  # add decontX corrected counts as a new assay
+  decont_counts <- decontXcounts(sce)
+  obj[["decontX_RNA"]] <- CreateAssayObject(counts = decont_counts)
+  
+  return(obj)
+})
+```
+
+
+
+```{r}
+run_DF_with_pK_optimization <- function(
+  obj,
+  PCs = 1:15,
+  pN = 0.25,
+  doublet_rate = 0.075,
+  resolution = 0.2
+) {
+  
+  sample_name <- unique(obj$orig.ident)
+  message("Running DoubletFinder with pK optimization: ", sample_name)
+  
+  DefaultAssay(obj) <- "RNA"
+  
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj)
+  obj <- ScaleData(obj)
+  obj <- RunPCA(obj, npcs = max(PCs))
+  obj <- FindNeighbors(obj, dims = PCs)
+  obj <- FindClusters(obj, resolution = resolution)
+  
+  sweep.res <- paramSweep(
+    obj,
+    PCs = PCs,
+    sct = FALSE
+  )
+  
+  sweep.stats <- summarizeSweep(
+    sweep.res,
+    GT = FALSE
+  )
+  
+  bcmvn <- find.pK(sweep.stats)
+  
+  best.pK <- as.numeric(as.character(
+    bcmvn$pK[which.max(bcmvn$BCmetric)]
+  ))
+  
+  message("Best pK for ", sample_name, ": ", best.pK)
+  
+  nExp_poi <- round(doublet_rate * ncol(obj))
+  
+  homotypic.prop <- modelHomotypic(obj$seurat_clusters)
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+  
+  obj <- doubletFinder(
+    obj,
+    PCs = PCs,
+    pN = pN,
+    pK = best.pK,
+    nExp = nExp_poi.adj,
+    reuse.pANN = NULL,
+    sct = FALSE
+  )
+  
+  df_class_col <- grep("DF.classifications", colnames(obj@meta.data), value = TRUE)
+  pann_col     <- grep("pANN", colnames(obj@meta.data), value = TRUE)
+  
+  obj$DF_class <- obj@meta.data[[df_class_col[length(df_class_col)]]]
+  obj$DF_pANN  <- obj@meta.data[[pann_col[length(pann_col)]]]
+  obj$DF_pK    <- best.pK
+  obj$DF_nExp  <- nExp_poi.adj
+  
+  return(obj)
+}
+```
+
+
+```{r}
+library(DoubletFinder)
+```
+
+
+```{r}
+sample.list <- lapply(sample.list, function(obj) {
+  sample_name <- unique(obj$orig.ident)
+  message("Running DecontX for: ", sample_name)
+  run_DF_with_pK_optimization(
+    obj,
+    PCs = 1:15,
+    pN = 0.25,
+    doublet_rate = 0.075,
+    resolution = 0.2
+  )
+})
+```
+
+
+
+
+
+```{r}
+save(sample.list, file = "decontX.doubletfinder.sample.list.Rdata")
+```
+
+
+
+```{r}
+df.meta.list <- lapply(sample.list, function(obj) {
+  meta <- obj@meta.data
+    # 自动寻找 DoubletFinder 相关列
+  df_class_col <- grep("^DF.classifications", colnames(meta), value = TRUE)
+  
+  out <- data.frame(
+    cell = rownames(meta),
+    contamination = meta$decontX_contamination,
+    DF_class = meta[[df_class_col]],
+    stringsAsFactors = FALSE
+  )
+  
+  return(out)
+})
+
+
+df.meta <- do.call(rbind, df.meta.list)
+
+rownames(df.meta) <- df.meta$cell
+
+new_merge_obj$contamination <- df.meta[colnames(new_merge_obj), "contamination"]
+new_merge_obj$DF_class    <- df.meta[colnames(new_merge_obj), "DF_class"]
+```
+
+
+
+```{r}
+table(new_merge_obj$orig.ident, new_merge_obj$DF_class, useNA = "ifany")
+table(new_merge_obj$orig.ident,new_merge_obj$contamination > 0.5)
+```
+
+
+```{r}
+save(new_merge_obj, file = "decontX.doubletfinder.merge.Rdata")
+```
+
+
+```{r}
+new_merge_obj <- subset(new_merge_obj, subset = DF_class == "Singlet")
+```
+
+
+```{r}
+DefaultAssay(new_merge_obj) <- "RNA"
+
+new_merge_obj <- NormalizeData(new_merge_obj)
+new_merge_obj <- FindVariableFeatures(new_merge_obj,selection.method = 'vst', nfeatures = 3000)
+new_merge_obj <- ScaleData(new_merge_obj,features = VariableFeatures(new_merge_obj),
+                           vars.to.regress = c("nCount_RNA", "percent.mt","contamination"))
+
+new_merge_obj <- RunPCA(new_merge_obj)
+new_merge_obj <- RunHarmony(new_merge_obj, group.by.vars = "orig.ident")
+new_merge_obj <- FindNeighbors(new_merge_obj, reduction = "harmony",
+                               dims = 1:20,graph.name = "rna_snn")
+new_merge_obj <- FindClusters(new_merge_obj,graph.name = "rna_snn", resolution = 0.2)
+
+new_merge_obj <- RunUMAP(new_merge_obj, reduction = "harmony", dims = 1:20)
+```
+
+
+
+
+```{r}
+DimPlot(new_merge_obj, reduction = "umap", label = T)
+DimPlot(new_merge_obj, reduction = "umap", label = T,group.by = "orig.ident")
+FeaturePlot(new_merge_obj, features = "contamination")
+table(new_merge_obj$orig.ident,new_merge_obj$contamination > 0.5)
+```
+
+
+```{r}
+marker_list <- list(
+  Excitatory_neurons = c("Slc17a7", "Camk2a", "Neurod6"),
+  Oligodendrocytes   = c("Mog", "Mag", "Mbp"),
+  Astrocytes         = c("Aqp4", "Slc1a3", "Gfap"),
+  Microglia_Myeloid  = c("P2ry12", "Tmem119", "Tyrobp"),
+  Inhibitory_neurons = c("Gad1", "Gad2", "Slc6a1"),
+  OPCs               = c("Pdgfra", "Cspg4", "Vcan"),
+  VLMC = c("Pdgfrb","Rgs5", "Col1a2"),
+  Endothelial_cells = c("Pecam1", "Cldn5", "Flt1"),
+  Lymphoid           = c("Ptprc", "Cd3e", "Nkg7"),
+  unknown            = c("Ttr", "Clic6", "Kcnj13")
+)
+
+for (gene in unlist(marker_list)) {
+  p <- FeaturePlot(new_merge_obj,gene)
+  pdf(file = paste0("Figure/",gene,".featureplot.pdf"),width=10,height=10)
+  print(p)
+  dev.off()
+}
+
+```
+
+
+
+```{r}
+VlnPlot(new_merge_obj, features = unlist(marker_list),flip = T, stack =T)
+VlnPlot(new_merge_obj, features = c( c("Pdgfrb","Rgs5", "Acta2"),
+                                     c("Pecam1", "Cldn5", "Flt1"),
+                                     c("Col1a1", "Col1a2"),
+                                     c("Abcc9", "Kcnj8")),flip = T, stack =T)
+```
+
+```{r}
+crude_anno <- c(
+  "0"  = "Excitatory_neurons",
+  "1"  = "Excitatory_neurons",
+  "2"  = "Oligodendrocytes",
+  "3"  = "Astrocytes",
+  "4"  = "Microglia_Myeloid",
+  "5"  = "Inhibitory_neurons",
+  "6"  = "OPCs",
+  "7"  = "Endothelial_cells",
+  "8"  = "VLMC",
+  "9"  = "Lymphoid",
+  "10" = "Inhibitory_neurons",
+  "11" = "unkown(Ttr_high)",
+  "12" = "unkown"
+)
+
+new_merge_obj$crude_anno <- unname(crude_anno[as.character(new_merge_obj$seurat_clusters)])
+```
+
+
+
+```{r}
+DimPlot(new_merge_obj, reduction = "umap", label = T,group.by = "crude_anno")
+```
+```{r}
+save(new_merge_obj, file = "newmerge.withspike.annotated.Rdata")
+```
+
+
+
+```{r}
+table(new_merge_obj$orig.ident,new_merge_obj$crude_anno)
+write.csv(table(new_merge_obj$orig.ident,new_merge_obj$crude_anno), file = "newmerge.withspike.nodoublet.csv")
+```
+
+
+
+
+```{r}
+table(new_merge_obj$orig.ident,new_merge_obj$contamination > 0.5)
+table(new_merge_obj$orig.ident,new_merge_obj$crude_anno)
+tab_contam_celltype <- table(
+  Sample = new_merge_obj$orig.ident,
+  Celltype = new_merge_obj$crude_anno,
+  HighContam = new_merge_obj$contamination > 0.5
+)
+
+tab_contam_celltype
+
+write.csv(tab_contam_celltype, file = "newmerge.contamination.sample.celltype.csv")
+```
+
+
+
+
+
+
+```{r}
+head(colnames(sub.keep.cells.obj))
+unique(sub.keep.cells.obj$orig.ident)
+head(colnames(new_merge_obj))
+unique(new_merge_obj$orig.ident)
+```
+
+
+```{r plos id management}
+cell_ids  <- colnames(sub.keep.cells.obj)
+barcode_len <- 18
+
+sample_id <- substr(cell_ids, 1, nchar(cell_ids) - barcode_len)
+barcode   <- substr(cell_ids, nchar(cell_ids) - barcode_len + 1, nchar(cell_ids))
+
+
+
+sample_id[sample_id == "Study-2-MOCK-90-DPI_"] <- "VEEV_Mock_106d_spike_VEEV_Mock_106d_spike_"
+sample_id[sample_id == "Study-2-VEEV-90-DPI_"] <- "VEEV_VEEV_106d_spike_VEEV_VEEV_106d_spike_"
+sample_id[sample_id == "Study-3-MOCK-7-DPI_"] <- "VEEV_Mock_7d_spike_VEEV_Mock_7d_spike_"
+sample_id[sample_id == "Study-3-VEEV-7-DPI_"] <- "VEEV_VEEV_7d_spike_VEEV_VEEV_7d_spike_"
+
+new_cell_id <- paste0(sample_id,barcode)
+colnames(sub.keep.cells.obj) <- new_cell_id
+```
+
+
+
+```{r veev id}
+new.veev.obj <- subset(new_merge_obj, subset = orig.ident %in% c("VEEV_Mock_106d_spike",
+                                                                 "VEEV_VEEV_106d_spike",
+                                                                 "VEEV_Mock_7d_spike",
+                                                                 "VEEV_VEEV_7d_spike"))
+```
+
+
+
+
+```{r}
+common_cells <- intersect(new_cell_id,colnames(new.veev.obj))
+```
+
+
+
+```{r}
+commoncell.plos.spike <- data.frame(common_cellid = common_cells,
+                                    plos = sub.keep.cells.obj$celltyp[common_cells],
+                                    spike = new_merge_obj$crude_anno[common_cells])
+```
+
+
+```{r}
+commoncell.plos.spike.ast.exc.inh <- commoncell.plos.spike[commoncell.plos.spike$plos %in% c("Astrocytes","Excitatory_neurons","Inhibitory_neurons") |commoncell.plos.spike$spike %in% c("Astrocytes","Excitatory_neurons","Inhibitory_neurons"),]
+```
+
+
+```{r}
+commoncell.plos.spike.ast.exc.inh.diff <- commoncell.plos.spike.ast.exc.inh[commoncell.plos.spike.ast.exc.inh$spike != commoncell.plos.spike.ast.exc.inh$plos,]
+```
+
+
+
+
+```{r}
+commoncell.plos.spike.ast.exc.inh.diff.tab <- table(commoncell.plos.spike.ast.exc.inh.diff$plos,
+                                                    commoncell.plos.spike.ast.exc.inh.diff$spike)
+
+write.csv(commoncell.plos.spike.ast.exc.inh.diff.tab,file = "commoncell.plos.spike.ast.exc.inh.diff.csv")
+```
+
+
+```{r}
+library(ggvenn)
+```
+
+
+
+```{r}
+ggvenn(list(plos = new_cell_id,spike = colnames(new.veev.obj)))
+```
+
+```{r}
+plos.exc.spike.inh.cell <- commoncell.plos.spike.ast.exc.inh.diff[
+  commoncell.plos.spike.ast.exc.inh.diff$plos == "Excitatory_neurons" & 
+    commoncell.plos.spike.ast.exc.inh.diff$spike == "Inhibitory_neurons",]
+
+
+
+plos.exp <- FetchData(sub.keep.cells.obj,cells = plos.exc.spike.inh.cell$common_cellid, 
+                      vars = c("Slc17a7","Gad2","Aqp4"))
+spike.exp <- FetchData(new.veev.obj,cells = plos.exc.spike.inh.cell$common_cellid,
+                       vars = c("Slc17a7","Gad2","Aqp4"))
+```
+
+
+```{r}
+boxplot(plos.exp$Slc17a7)
+boxplot(spike.exp$Slc17a7)
+
+boxplot(plos.exp$Gad2)
+boxplot(spike.exp$Gad2)
+
+
+
+```
+```{r}
+exc_markers <- c("Slc17a7", "Camk2a", "Camk2b", "Neurod6", "Satb2")
+inh_markers <- c("Gad1", "Gad2", "Slc6a1", "Slc32a1", "Dlx1", "Dlx2")
+
+VlnPlot(
+  new_merge_obj[,as.character(plos.exc.spike.inh.cell$common_cellid)],
+  features = c(exc_markers, inh_markers),
+  stack = TRUE,
+  flip = TRUE,
+  pt.size = 0
+)
+
+
+summary(new_merge_obj[,as.character(plos.exc.spike.inh.cell$common_cellid)]$seurat_clusters)
+quantile(new_merge_obj[,as.character(plos.exc.spike.inh.cell$common_cellid)]$contamination)
+```
+
+
+```{r}
+p <- DimPlot(new_merge_obj, cells.highlight = as.character(plos.exc.spike.inh.cell$common_cellid),pt.size = 0.1)
+```
+
+```{r}
+roughcount <- CellSelector(p)
+```
+
+
+
+```{r}
+table(new_merge_obj[,roughcount]$orig.ident)
+
+quantile(new_merge_obj[,roughcount]$contamination)
+```
+
+
+
+
+

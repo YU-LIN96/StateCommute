@@ -1,0 +1,202 @@
+---
+title: ''
+author: "Yu"
+date: "2026-06-02"
+output: html_document
+---
+
+```{r}
+# =============================================================================
+#  State module summary  +  pull ALL parent-term genes, flag State DEGs,
+#  per-State pseudobulk heatmap
+#  Downstream of: parent_terms_df (representative modules per State)
+# =============================================================================
+#
+#  Part 1  Per-State module summary, ranked by REAL marker stats (not `score`).
+#  Part 2  Pull ALL genes of each parent term from genesets_mouse_final,
+#          then MARK which genes are also State DEGs (no filtering).
+#  Part 3  Per-State average expression z-score heatmap of the pulled genes,
+#          with a DEG row annotation.
+#
+# -----------------------------------------------------------------------------
+#  >>> CHECK THIS CONFIG BLOCK AGAINST YOUR ENVIRONMENT BEFORE RUNNING <<<
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(Seurat)
+library(ComplexHeatmap)
+library(circlize)
+
+seu          <- MG.recluster.obj          # your Seurat object
+state_col    <- "state_anno"                   # metadata column holding State1..State5
+rna_assay    <- "RNA"                      # gene-expression assay ("RNA" or "SCT")
+states       <- c("State1","State2","State3","State4","State5")
+# genesets_mouse_final : named list  gene_set_name -> character vector of genes
+# state_colors         : named vector State -> colour
+# state.each.pathway.markers.sig.fld : pathway-level marker table
+
+# parent_terms_df <- read.csv("MAY_parent_terms_df_MG.csv", row.names = 1,
+#                             stringsAsFactors = FALSE)
+
+padj_cut <- 0.05
+lfc_cut  <- 0.25
+min_pct  <- 0.10
+
+
+# =============================================================================
+#  PART 1 — State module summary  (ranked by real stats, not `score`)
+# =============================================================================
+pathway_stats <- state.each.pathway.markers.sig.fld %>%
+  dplyr::transmute(cluster,
+                   term       = gene,        # pathway name lives in `gene`
+                   avg_log2FC,                # <- rename if your table differs
+                   p_val_adj)                 # <- rename if your table differs
+
+state_summary <- parent_terms_df %>%
+  dplyr::left_join(pathway_stats, by = c("term", "cluster")) %>%
+  dplyr::group_by(term) %>%
+  dplyr::mutate(n_states = dplyr::n_distinct(cluster),
+                is_shared = n_states > 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(cluster, dplyr::desc(avg_log2FC))
+
+state_overview <- state_summary %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(n_modules        = dplyr::n(),
+                   n_state_specific = sum(!is_shared),
+                   n_shared         = sum(is_shared),
+                   top5_modules     = paste(head(term[order(-avg_log2FC)], 5),
+                                            collapse = " | "),
+                   .groups = "drop")
+
+print(state_overview)
+write.csv(state_summary,  "state_module_summary_full.csv", row.names = FALSE)
+write.csv(state_overview, "state_module_overview.csv",     row.names = FALSE)
+
+
+# =============================================================================
+#  PART 2 — Pull ALL parent-term genes, then flag State DEGs
+# =============================================================================
+# (A) Gene-level State DEGs on the RNA assay.
+#     If you already have a gene-level marker table, assign it to `gene_markers`
+#     and skip FindAllMarkers (it can be slow).
+DefaultAssay(seu) <- rna_assay
+Idents(seu)       <- state_col
+gene_markers <- Seurat::FindAllMarkers(seu, only.pos = TRUE,
+                                       min.pct = min_pct,
+                                       logfc.threshold = lfc_cut)
+
+deg_pairs <- gene_markers %>%                       # (gene, state) DEG pairs
+  dplyr::filter(p_val_adj < padj_cut) %>%
+  dplyr::distinct(gene, cluster)
+
+deg_state_map <- deg_pairs %>%                      # gene -> which state(s) DEG
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(deg_states = paste(sort(unique(cluster)), collapse = ","),
+                   n_deg_states = dplyr::n_distinct(cluster), .groups = "drop")
+
+# (B) Pull EVERY gene of each parent term (no filtering), keep module+State link
+missing_terms <- setdiff(parent_terms_df$term, names(genesets_mouse_final))
+if (length(missing_terms) > 0)
+  warning(sprintf("%d module(s) not in genesets_mouse_final: %s",
+                  length(missing_terms), paste(head(missing_terms, 5), collapse = ", ")))
+
+module_gene_long <- parent_terms_df %>%
+  dplyr::distinct(term, cluster) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(gene = list(genesets_mouse_final[[term]])) %>%
+  dplyr::ungroup() %>%
+  tidyr::unnest(gene) %>%
+  dplyr::filter(!is.na(gene), nzchar(gene)) %>%
+  # flag: DEG in the SAME state as its module  (== the "leading-edge" subset)
+  dplyr::mutate(is_deg_in_state =
+                  paste(gene, cluster) %in% paste(deg_pairs$gene, deg_pairs$cluster)) %>%
+  dplyr::left_join(deg_state_map, by = "gene") %>%
+  dplyr::mutate(is_deg_any = !is.na(deg_states))
+
+message(sprintf("Pulled %d unique genes from %d modules; %d are DEG in some state, %d are DEG in their own module's state.",
+                dplyr::n_distinct(module_gene_long$gene),
+                dplyr::n_distinct(module_gene_long$term),
+                dplyr::n_distinct(module_gene_long$gene[module_gene_long$is_deg_any]),
+                dplyr::n_distinct(module_gene_long$gene[module_gene_long$is_deg_in_state])))
+
+write.csv(module_gene_long, "parent_term_genes_with_DEG_flag.csv", row.names = FALSE)
+
+# (C) one row per gene for the heatmap (genes can come from several modules)
+gene_tab <- module_gene_long %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(from_states  = paste(sort(unique(cluster)), collapse = ","),
+                   n_src_states = dplyr::n_distinct(cluster),
+                   n_modules    = dplyr::n_distinct(term),
+                   is_deg_any   = any(is_deg_any),
+                   deg_states   = dplyr::first(deg_states),
+                   .groups = "drop") %>%
+  # source State of the gene's parent term(s): single State, else "Multiple"
+  dplyr::mutate(source_state = ifelse(n_src_states == 1, from_states, "Multiple"),
+                source_state = factor(source_state, levels = c(states, "Multiple")))
+
+
+# =============================================================================
+#  PART 3 — Per-State average expression z-score heatmap (DEG-annotated)
+# =============================================================================
+feat <- intersect(gene_tab$gene, rownames(seu[[rna_assay]]))
+gene_tab <- dplyr::filter(gene_tab, gene %in% feat)
+
+avg <- Seurat::AverageExpression(seu, assays = rna_assay,
+                                 features = gene_tab$gene,
+                                 group.by = state_col,
+                                 layer = "data")[[rna_assay]]   # v4: slot="data"
+avg <- avg[gene_tab$gene, states, drop = FALSE]
+mat <- as.matrix(avg)
+
+# --- Drop zero-variance (flat) genes: they z-score to NaN / all-zero rows ---
+#     IMPORTANT: filter mat AND gene_tab together so the row annotation stays aligned.
+keep <- apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0 & is.finite(sd(x, na.rm = TRUE)))
+message(sprintf("Dropping %d zero-variance gene(s); %d retained.", sum(!keep), sum(keep)))
+mat      <- mat[keep, , drop = FALSE]
+gene_tab <- gene_tab[keep, , drop = FALSE]
+gene_tab$source_state <- droplevels(gene_tab$source_state)   # avoid empty slices
+
+# z-score per gene across States (no NA left now, but guard just in case)
+mat_z <- t(scale(t(mat)))
+mat_z[is.na(mat_z)] <- 0
+
+col_fun <- colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B"))
+
+# colours for the source-State annotation (your palette + grey for multi-source)
+src_cols <- c(state_colors[states], Multiple = "grey60")
+
+row_anno <- rowAnnotation(
+  SourceState = gene_tab$source_state,                 # State of the parent term
+  DEG         = ifelse(gene_tab$is_deg_any, "DEG", "not DEG"),
+  col = list(SourceState = src_cols,
+             DEG = c("DEG" = "#D7301F", "not DEG" = "grey85")),
+  show_annotation_name = TRUE
+)
+
+h_genes <- Heatmap(
+  mat_z,
+  name               = "z-score",
+  col                = col_fun,
+  cluster_columns    = FALSE,
+  cluster_rows       = TRUE,                  # cluster WITHIN each State block
+  cluster_row_slices = FALSE,                 # keep block order State1..State5, Multiple
+  row_split          = gene_tab$source_state, # block rows by source-term State
+  show_row_dend      = FALSE,
+  left_annotation    = row_anno,
+  show_row_names     = nrow(mat_z) <= 80,
+  row_names_gp       = grid::gpar(fontsize = 6),
+  row_title_gp       = grid::gpar(fontsize = 9),
+  show_column_names  = TRUE,
+  column_title       = sprintf("Parent-term genes (%d) | per-State z-score | DEGs flagged",
+                               nrow(mat_z)),
+  use_raster         = TRUE
+)
+
+pdf("./Figure_Final/parent_term_genes_DEGflag_htmp.pdf", width = 8, height = 11)
+draw(h_genes)
+dev.off()
+
+h_genes
+```
+

@@ -1,0 +1,766 @@
+---
+title: "AUCell matrix: PCA vs NMF benchmark (RcppML)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r global-opts, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+```{r setup, include=FALSE}
+# PCA vs NMF benchmark on a single AUCell pathway-score matrix.
+# Goal: on the SAME AUCell matrix, compare PCA and NMF as low-dimensional
+# decompositions across reconstruction, component structure, graph modularity,
+# reference-label agreement, and cluster compactness/separation.
+# NOTE: this evaluates clustering geometry + reference agreement only; it does
+# NOT establish biological superiority of either method.
+
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(Seurat)
+  library(RcppML)
+  library(igraph)
+  library(cluster)
+  library(tidyverse)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+```
+
+```{r parameters}
+# -----------------------------------------------------------------------------
+# PARAMETERS — edit to suit your data / compute budget
+# -----------------------------------------------------------------------------
+SEURAT_OBJ      <- MG.recluster.obj
+ASSAY           <- "AUCell"
+SLOT            <- "data"
+
+REFERENCE_LABEL <- "state_anno"      # column in obj@meta.data used as reference
+
+# Subsampling / feature selection (to bound memory & runtime)
+MAX_CELLS       <- 5000              # NA or Inf to keep all cells
+TOP_FEATURES    <- 2000              # NA or Inf to keep all (after zero-var removal)
+
+# Decomposition grids (compared at the SAME component counts)
+PCA_K_LIST      <- c(5, 10, 15, 20, 30)
+NMF_RANK_LIST   <- c(5, 10, 15, 20, 30)
+
+# Clustering grids (identical for both methods)
+K_PARAM_LIST    <- c(10, 20, 30)
+RESOLUTION_LIST <- c(0.2, 0.5, 0.8, 1.0)
+CLUSTER_ALGO    <- 1                 # Seurat FindClusters: 1 = original Louvain
+
+# NMF settings (RcppML backend)
+NMF_NRUN        <- 10                # random inits; consensus cophenetic needs > 1
+NMF_SEED        <- 123
+NMF_TOL         <- 1e-4              # RcppML convergence tolerance
+NMF_MAXIT       <- 100               # RcppML max iterations
+NMF_L1          <- 0                 # optional L1 sparsity penalty (0 = none)
+NMF_DO_MINMAX   <- FALSE             # optional per-feature min-max scaling of NMF input
+COPH_MAX_CELLS  <- 1500              # subsample cells for consensus/cophenetic (O(n^2))
+
+# PCA settings
+PCA_CENTER      <- TRUE
+PCA_SCALE       <- TRUE
+
+# Reproducibility & misc
+SEED            <- 42
+SIL_MAX_CELLS   <- 3000              # subsample for silhouette/DBI distance (O(n^2))
+OUT_PREFIX      <- "AUCell_PCA_NMF"
+
+METHOD_COLOURS  <- c(PCA = "#1E88E5", NMF = "#E53935")
+```
+
+```{r dependencies}
+# -----------------------------------------------------------------------------
+# Fail early with a clear message if required packages are missing.
+# -----------------------------------------------------------------------------
+check_dependencies <- function() {
+  need <- c("Matrix", "Seurat", "RcppML", "igraph", "cluster",
+            "ggplot2", "dplyr", "tidyr", "patchwork", "scales")
+  miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(miss) > 0)
+    stop("Missing required package(s): ", paste(miss, collapse = ", "),
+         "\nInstall them before running this benchmark.", call. = FALSE)
+  invisible(TRUE)
+}
+```
+
+```{r matrix-preparation}
+# -----------------------------------------------------------------------------
+# Extract AUCell assay as a features x cells matrix.
+# -----------------------------------------------------------------------------
+extract_assay_matrix <- function(seurat_obj, assay = ASSAY, slot = SLOT) {
+  stopifnot(assay %in% names(seurat_obj@assays))
+  mat <- tryCatch(
+    Seurat::GetAssayData(seurat_obj, assay = assay, layer = slot),
+    error = function(e) Seurat::GetAssayData(seurat_obj, assay = assay, slot = slot)
+  )
+  mat <- as.matrix(mat)
+  # Ensure features x cells
+  if (ncol(mat) != length(colnames(seurat_obj)) &&
+      nrow(mat) == length(colnames(seurat_obj))) {
+    mat <- t(mat)
+  }
+  cat(sprintf("[extract] %s/%s : %d features x %d cells\n",
+              assay, slot, nrow(mat), ncol(mat)))
+  mat
+}
+
+# -----------------------------------------------------------------------------
+# Subsample cells, drop zero-variance features, keep top-variance features.
+# Returns a features x cells matrix with stable row/col names.
+# -----------------------------------------------------------------------------
+prepare_benchmark_matrix <- function(mat,
+                                     max_cells    = MAX_CELLS,
+                                     top_features = TOP_FEATURES,
+                                     seed         = SEED) {
+  set.seed(seed)
+
+  # subsample cells
+  if (is.finite(max_cells) && ncol(mat) > max_cells) {
+    keep <- sample(colnames(mat), max_cells)
+    mat  <- mat[, keep, drop = FALSE]
+    cat(sprintf("[prepare] subsampled cells -> %d\n", ncol(mat)))
+  }
+
+  # drop zero-variance features
+  fvar  <- matrixStats_rowVars(mat)
+  nzv   <- fvar > .Machine$double.eps
+  if (any(!nzv))
+    cat(sprintf("[prepare] removed %d zero-variance features\n", sum(!nzv)))
+  mat   <- mat[nzv, , drop = FALSE]
+  fvar  <- fvar[nzv]
+
+  # keep top-variance features
+  if (is.finite(top_features) && nrow(mat) > top_features) {
+    keep <- order(fvar, decreasing = TRUE)[seq_len(top_features)]
+    mat  <- mat[sort(keep), , drop = FALSE]
+    cat(sprintf("[prepare] kept top %d variance features\n", nrow(mat)))
+  }
+
+  cat(sprintf("[prepare] final matrix: %d features x %d cells\n",
+              nrow(mat), ncol(mat)))
+  mat
+}
+
+# Lightweight row variances (avoids a matrixStats dependency)
+matrixStats_rowVars <- function(m) {
+  mu <- rowMeans(m)
+  rowSums((m - mu)^2) / (ncol(m) - 1)
+}
+
+# -----------------------------------------------------------------------------
+# Pull the reference label for the retained cells; clear error if absent.
+# -----------------------------------------------------------------------------
+get_reference_label <- function(seurat_obj, cells, label = REFERENCE_LABEL) {
+  if (!label %in% colnames(seurat_obj@meta.data))
+    stop(sprintf("Reference label '%s' not found in obj@meta.data. Available: %s",
+                 label, paste(colnames(seurat_obj@meta.data), collapse = ", ")),
+         call. = FALSE)
+  ref <- seurat_obj@meta.data[cells, label]
+  ref <- as.factor(as.character(ref))
+  names(ref) <- cells
+  ref
+}
+
+# -----------------------------------------------------------------------------
+# Inputs for each method (control variable: same source matrix).
+# -----------------------------------------------------------------------------
+prepare_pca_input <- function(mat_feat_by_cell) {
+  # PCA operates on cells x features; centering/scaling handled by prcomp.
+  t(mat_feat_by_cell)
+}
+
+prepare_nmf_input <- function(mat_feat_by_cell, do_minmax = NMF_DO_MINMAX) {
+  V  <- as.matrix(mat_feat_by_cell)            # features x cells
+  mn <- min(V)
+  if (mn < 0) {                                # shift to non-negative
+    V <- V - mn
+    cat(sprintf("[nmf-input] negative values detected; shifted by %.4g\n", -mn))
+  }
+  if (do_minmax) {                             # optional per-feature min-max
+    rmin <- apply(V, 1, min); rmax <- apply(V, 1, max)
+    rng  <- rmax - rmin; rng[rng == 0] <- 1
+    V <- (V - rmin) / rng
+    cat("[nmf-input] applied per-feature min-max scaling\n")
+  }
+  V
+}
+```
+
+```{r metric-helpers}
+# -----------------------------------------------------------------------------
+# Generic numeric helpers used by both decomposition and clustering metrics.
+# -----------------------------------------------------------------------------
+.frob <- function(x) sqrt(sum(x^2))
+
+frv <- function(X, Xhat) sum((X - Xhat)^2) / sum(X^2)   # residual variance fraction
+reconstruction_error <- function(X, Xhat) .frob(X - Xhat)
+
+# Hoyer sparsity of a vector in [0,1] (1 = maximally sparse)
+hoyer_sparsity <- function(v) {
+  v <- abs(v); n <- length(v)
+  if (n <= 1) return(NA_real_)
+  s2 <- sqrt(sum(v^2)); if (s2 == 0) return(NA_real_)
+  (sqrt(n) - sum(v) / s2) / (sqrt(n) - 1)
+}
+# Mean Hoyer sparsity across the columns of a matrix
+matrix_sparsity <- function(M) mean(apply(M, 2, hoyer_sparsity), na.rm = TRUE)
+
+# Mean absolute off-diagonal correlation among components (columns of M)
+component_redundancy <- function(M) {
+  if (ncol(M) < 2) return(0)
+  C  <- suppressWarnings(stats::cor(M))
+  od <- C[upper.tri(C)]
+  mean(abs(od), na.rm = TRUE)
+}
+
+# Adjusted Rand index (base R; no external dependency)
+adjusted_rand_index <- function(a, b) {
+  tab <- table(a, b)
+  comb2 <- function(x) sum(choose(x, 2))
+  n  <- sum(tab)
+  idx     <- comb2(tab)
+  exp_idx <- comb2(rowSums(tab)) * comb2(colSums(tab)) / choose(n, 2)
+  max_idx <- (comb2(rowSums(tab)) + comb2(colSums(tab))) / 2
+  if (max_idx == exp_idx) return(0)
+  (idx - exp_idx) / (max_idx - exp_idx)
+}
+
+# Cluster purity against a reference labelling
+cluster_purity <- function(clusters, reference) {
+  tab <- table(clusters, reference)
+  sum(apply(tab, 1, max)) / sum(tab)
+}
+
+# Davies-Bouldin index (lower = better; base R)
+davies_bouldin <- function(emb, clusters) {
+  cl <- as.integer(factor(clusters)); ks <- sort(unique(cl)); K <- length(ks)
+  if (K < 2) return(NA_real_)
+  cent <- t(vapply(ks, function(k) colMeans(emb[cl == k, , drop = FALSE]),
+                   numeric(ncol(emb))))
+  S <- vapply(ks, function(k) {
+    pts <- emb[cl == k, , drop = FALSE]
+    if (nrow(pts) <= 1) return(0)
+    mean(sqrt(rowSums(sweep(pts, 2, colMeans(pts))^2)))
+  }, numeric(1))
+  db <- 0
+  for (i in seq_len(K)) {
+    rij <- vapply(setdiff(seq_len(K), i), function(j) {
+      mij <- sqrt(sum((cent[i, ] - cent[j, ])^2))
+      if (mij == 0) 0 else (S[i] + S[j]) / mij
+    }, numeric(1))
+    db <- db + max(rij)
+  }
+  db / K
+}
+
+# Mean / median silhouette in an embedding space (subsamples for O(n^2) cost)
+silhouette_summary <- function(emb, clusters, max_cells = SIL_MAX_CELLS, seed = SEED) {
+  cl <- as.integer(factor(clusters))
+  if (length(unique(cl)) < 2) return(c(mean = NA_real_, median = NA_real_))
+  set.seed(seed)
+  if (nrow(emb) > max_cells) {
+    idx <- sample(seq_len(nrow(emb)), max_cells)
+    emb <- emb[idx, , drop = FALSE]; cl <- cl[idx]
+    if (length(unique(cl)) < 2) return(c(mean = NA_real_, median = NA_real_))
+  }
+  sil <- cluster::silhouette(cl, stats::dist(emb))
+  if (is.na(sil[1])) return(c(mean = NA_real_, median = NA_real_))
+  w <- sil[, "sil_width"]
+  c(mean = mean(w), median = stats::median(w))
+}
+```
+
+```{r pca-benchmark}
+# -----------------------------------------------------------------------------
+# Run PCA once (up to max k); reconstruct and score each k.
+# -----------------------------------------------------------------------------
+run_pca <- function(cells_by_feat, max_k, center = PCA_CENTER, scale = PCA_SCALE,
+                    seed = SEED) {
+  set.seed(seed)
+  prcomp(cells_by_feat, center = center, scale. = scale, rank. = max_k)
+}
+
+# Decomposition metrics + cells x PCs embedding for a given k
+pca_decomp_metrics <- function(pca, cells_by_feat, k) {
+  var_all <- pca$sdev^2
+  expl    <- cumsum(var_all) / sum(var_all)
+  # work in the centered/scaled space PCA operates on
+  Xc   <- scale(cells_by_feat, center = pca$center, scale = pca$scale)
+  sc   <- pca$x[, seq_len(k), drop = FALSE]
+  load <- pca$rotation[, seq_len(k), drop = FALSE]
+  Xhat <- sc %*% t(load)
+
+  list(
+    metrics = data.frame(
+      method               = "PCA",
+      n_components         = k,
+      FRV                  = 1 - expl[k],
+      reconstruction_error = reconstruction_error(Xc, Xhat),
+      explained_signal     = expl[k],
+      component_sparsity   = matrix_sparsity(load),         # loading sparsity
+      coefficient_sparsity = NA_real_,                      # PCA: not applicable
+      component_redundancy = component_redundancy(sc),      # PC-score redundancy (~0)
+      cophenetic           = NA_real_,
+      stringsAsFactors = FALSE
+    ),
+    embedding = sc                                          # cells x PCs
+  )
+}
+```
+
+```{r nmf-benchmark}
+# -----------------------------------------------------------------------------
+# NMF via RcppML.  RcppML factorises  V ~= W diag(d) H  and returns a list with
+# $w (features x k), $d (length k), $h (k x cells); it drops dimnames, so we
+# re-attach them. We do nrun random inits, keep the best by reconstruction
+# error, and build a consensus matrix across runs to get a cophenetic
+# coefficient (RcppML has no built-in cophenetic).
+# -----------------------------------------------------------------------------
+
+# Robustly pull a field from an RcppML fit (list in v0.3.x; S4 in newer versions)
+.pick <- function(fit, nm) {
+  v <- tryCatch(fit[[nm]], error = function(e) NULL)
+  if (is.null(v)) v <- tryCatch(methods::slot(fit, nm), error = function(e) NULL)
+  v
+}
+
+# Single RcppML run -> normalised parts list(W, H, d) with dimnames restored
+run_nmf <- function(feat_by_cell, rank, seed = NMF_SEED,
+                    tol = NMF_TOL, maxit = NMF_MAXIT, L1 = NMF_L1) {
+  fit <- RcppML::nmf(feat_by_cell, k = rank, seed = seed, tol = tol,
+                     maxit = maxit, L1 = c(L1, L1), verbose = FALSE)
+  W <- .pick(fit, "w"); H <- .pick(fit, "h"); d <- .pick(fit, "d")
+  if (is.null(W) || is.null(H))
+    stop("Could not extract W/H from RcppML fit (unexpected API).", call. = FALSE)
+  if (is.null(d)) d <- rep(1, ncol(W))
+  rownames(W) <- rownames(feat_by_cell)
+  colnames(H) <- colnames(feat_by_cell)
+  list(W = W, H = H, d = d)
+}
+
+# Consensus cophenetic coefficient across runs (cells subsampled for O(n^2) cost)
+nmf_cophenetic <- function(parts, n_cells, max_cells = COPH_MAX_CELLS, seed = NMF_SEED) {
+  if (length(parts) < 2) return(NA_real_)
+  set.seed(seed)
+  idx <- if (n_cells > max_cells) sort(sample.int(n_cells, max_cells)) else seq_len(n_cells)
+  m    <- length(idx)
+  conn <- matrix(0, m, m)
+  for (p in parts) {
+    Huse <- p$d * p$H[, idx, drop = FALSE]              # scale rows by d
+    a    <- max.col(t(Huse), ties.method = "first")     # dominant component / cell
+    conn <- conn + outer(a, a, `==`)
+  }
+  consensus <- conn / length(parts)
+  dco <- stats::as.dist(1 - consensus)
+  hc  <- stats::hclust(dco, method = "average")
+  stats::cor(as.vector(dco), as.vector(stats::cophenetic(hc)))
+}
+
+# Multiple inits -> best fit (lowest reconstruction error) + cophenetic
+run_nmf_multi <- function(feat_by_cell, rank, nrun = NMF_NRUN, seed = NMF_SEED) {
+  set.seed(seed)
+  seeds <- sample.int(1e6, nrun)
+  parts <- lapply(seeds, function(s) run_nmf(feat_by_cell, rank, seed = s))
+  Vm    <- as.matrix(feat_by_cell)
+  errs  <- vapply(parts, function(p)
+    reconstruction_error(Vm, sweep(p$W, 2, p$d, "*") %*% p$H), numeric(1))
+  list(best       = parts[[which.min(errs)]],
+       cophenetic = nmf_cophenetic(parts, ncol(feat_by_cell), seed = seed),
+       n_runs     = nrun,
+       errors     = errs)
+}
+
+# Decomposition metrics + cells x components embedding from a multi-run result
+nmf_decomp_metrics <- function(nmf_res, V, rank) {
+  p    <- nmf_res$best
+  Wd   <- sweep(p$W, 2, p$d, "*")     # W diag(d)
+  Huse <- p$d * p$H                   # diag(d) H
+  Xhat <- Wd %*% p$H                  # = W diag(d) H
+  f    <- frv(V, Xhat)
+
+  list(
+    metrics = data.frame(
+      method               = "NMF",
+      n_components         = rank,
+      FRV                  = f,
+      reconstruction_error = reconstruction_error(V, Xhat),
+      explained_signal     = 1 - f,
+      component_sparsity   = matrix_sparsity(p$W),        # basis sparsity
+      coefficient_sparsity = matrix_sparsity(t(p$H)),     # coefficient sparsity (per cell)
+      component_redundancy = component_redundancy(t(Huse)),
+      cophenetic           = nmf_res$cophenetic,
+      stringsAsFactors = FALSE
+    ),
+    embedding = t(Huse)                                   # cells x NMF components
+  )
+}
+```
+
+```{r decomposition-runner}
+# -----------------------------------------------------------------------------
+# Run both decompositions across their component grids.
+# Returns: long decomposition-metric df + a named list of embeddings.
+# -----------------------------------------------------------------------------
+run_decomposition_benchmark <- function(mat_feat_by_cell,
+                                        pca_k_list    = PCA_K_LIST,
+                                        nmf_rank_list = NMF_RANK_LIST,
+                                        seed          = SEED) {
+  embeddings <- list()
+  rows       <- list()
+
+  # --- PCA ---
+  cat("\n[PCA] running ...\n")
+  pca_in  <- prepare_pca_input(mat_feat_by_cell)
+  pca_fit <- run_pca(pca_in, max_k = max(pca_k_list), seed = seed)
+  for (k in pca_k_list) {
+    res <- pca_decomp_metrics(pca_fit, pca_in, k)
+    rows[[length(rows) + 1]]        <- res$metrics
+    embeddings[[paste0("PCA|", k)]] <- res$embedding
+    cat(sprintf("  PCA k=%-3d  FRV=%.3f\n", k, res$metrics$FRV))
+  }
+
+  # --- NMF (RcppML, nrun random inits) ---
+  cat("\n[NMF] running (RcppML, nrun =", NMF_NRUN, ") ...\n")
+  V <- prepare_nmf_input(mat_feat_by_cell)
+  for (r in nmf_rank_list) {
+    nr  <- run_nmf_multi(V, rank = r)
+    res <- nmf_decomp_metrics(nr, V, r)
+    rows[[length(rows) + 1]]         <- res$metrics
+    embeddings[[paste0("NMF|", r)]]  <- res$embedding
+    cat(sprintf("  NMF rank=%-3d  FRV=%.3f  coph=%.3f\n",
+                r, res$metrics$FRV, res$metrics$cophenetic))
+  }
+
+  list(decomposition = dplyr::bind_rows(rows), embeddings = embeddings)
+}
+```
+
+```{r clustering-runner}
+# -----------------------------------------------------------------------------
+# One clustering on an embedding: same algorithm for PCA and NMF.
+# -----------------------------------------------------------------------------
+cluster_once <- function(embedding, k_param, resolution,
+                         algorithm = CLUSTER_ALGO, seed = SEED) {
+  nn  <- Seurat::FindNeighbors(embedding, k.param = k_param, verbose = FALSE)
+  snn <- nn$snn
+  cl  <- Seurat::FindClusters(snn, resolution = resolution, algorithm = algorithm,
+                              random.seed = seed, verbose = FALSE)
+  memb <- if (is.data.frame(cl)) cl[[1]] else cl
+  memb <- factor(as.character(memb))
+  names(memb) <- rownames(embedding)
+  list(clusters = memb, snn = snn)
+}
+
+# Graph modularity for a membership on an SNN graph
+graph_modularity <- function(snn, memb) {
+  g <- igraph::graph_from_adjacency_matrix(
+    methods::as(snn, "CsparseMatrix"), mode = "undirected",
+    weighted = TRUE, diag = FALSE)
+  igraph::modularity(g, membership = as.integer(factor(memb)))
+}
+
+# Full quality metric set for one clustering result
+clustering_quality <- function(embedding, memb, snn, reference) {
+  ref   <- reference[rownames(embedding)]
+  sizes <- as.integer(table(memb))
+  sil   <- silhouette_summary(embedding, memb)
+  data.frame(
+    ARI             = adjusted_rand_index(memb, ref),
+    purity          = cluster_purity(memb, ref),
+    modularity      = graph_modularity(snn, memb),
+    mean_silhouette = unname(sil["mean"]),
+    median_silhouette = unname(sil["median"]),
+    DBI             = davies_bouldin(embedding, memb),
+    n_clusters      = length(unique(memb)),
+    min_cluster_size    = min(sizes),
+    median_cluster_size = stats::median(sizes),
+    max_cluster_size    = max(sizes),
+    stringsAsFactors = FALSE
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Clustering benchmark over every embedding x k_param x resolution.
+# -----------------------------------------------------------------------------
+run_clustering_benchmark <- function(embeddings, reference,
+                                     k_param_list    = K_PARAM_LIST,
+                                     resolution_list = RESOLUTION_LIST,
+                                     seed            = SEED) {
+  rows <- list()
+  for (key in names(embeddings)) {
+    parts  <- strsplit(key, "\\|")[[1]]
+    method <- parts[1]; ncomp <- as.integer(parts[2])
+    emb    <- embeddings[[key]]
+    for (kp in k_param_list) {
+      for (res in resolution_list) {
+        cc <- tryCatch(cluster_once(emb, kp, res, seed = seed),
+                       error = function(e) { warning(e$message); NULL })
+        if (is.null(cc)) next
+        q  <- clustering_quality(emb, cc$clusters, cc$snn, reference)
+        rows[[length(rows) + 1]] <- cbind(
+          data.frame(method = method, n_components = ncomp,
+                     k_param = kp, resolution = res,
+                     stringsAsFactors = FALSE), q)
+        cat(sprintf("  %s n=%-3d k=%-3d res=%.2f  ARI=%.3f  nclust=%d\n",
+                    method, ncomp, kp, res, q$ARI, q$n_clusters))
+      }
+    }
+  }
+  dplyr::bind_rows(rows)
+}
+```
+
+```{r assemble-long}
+# -----------------------------------------------------------------------------
+# Unified long-format table (decomposition + clustering metrics).
+# -----------------------------------------------------------------------------
+assemble_all_metrics_long <- function(decomp_df, clust_df) {
+  dec_long <- decomp_df %>%
+    tidyr::pivot_longer(cols = c(FRV, reconstruction_error, explained_signal,
+                                 component_sparsity, coefficient_sparsity,
+                                 component_redundancy, cophenetic),
+                        names_to = "metric", values_to = "value") %>%
+    dplyr::mutate(k_param = NA_integer_, resolution = NA_real_,
+                  metric_type = "decomposition")
+
+  clu_long <- clust_df %>%
+    tidyr::pivot_longer(cols = c(ARI, purity, modularity, mean_silhouette,
+                                 median_silhouette, DBI, n_clusters,
+                                 min_cluster_size, median_cluster_size,
+                                 max_cluster_size),
+                        names_to = "metric", values_to = "value") %>%
+    dplyr::mutate(metric_type = "clustering")
+
+  dplyr::bind_rows(dec_long, clu_long) %>%
+    dplyr::select(method, n_components, k_param, resolution,
+                  metric_type, metric, value)
+}
+```
+
+```{r plots}
+.bench_theme <- function() {
+  theme_minimal(base_size = 12) +
+    theme(panel.grid      = element_blank(),
+          panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.4),
+          legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 12),
+          strip.text = element_text(face = "bold"))
+}
+
+# FRV vs number of components (lower = better)
+plot_frv <- function(decomp_df) {
+  ggplot(decomp_df, aes(n_components, FRV, color = method)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 2.2) +
+    scale_color_manual(values = METHOD_COLOURS, name = "Method") +
+    labs(title = "Residual variance fraction (FRV) vs components",
+         subtitle = "Lower is better",
+         x = "Components / rank", y = "FRV") +
+    .bench_theme()
+}
+
+# ARI across k_param, faceted by resolution
+plot_ari_facet <- function(clust_df) {
+  ggplot(clust_df, aes(factor(k_param), ARI, color = method, group = method)) +
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
+    stat_summary(fun = mean, geom = "point", size = 2) +
+    facet_wrap(~ resolution, nrow = 1, labeller = label_both) +
+    scale_color_manual(values = METHOD_COLOURS, name = "Method") +
+    labs(title = "ARI vs k_param (faceted by resolution)",
+         subtitle = "Mean over component counts; higher is better",
+         x = "k_param", y = "ARI") +
+    .bench_theme()
+}
+
+# Modularity barplot (best parameter per method/component shown via max)
+plot_modularity_bar <- function(clust_df) {
+  d <- clust_df %>% dplyr::group_by(method, n_components) %>%
+    dplyr::summarise(modularity = max(modularity, na.rm = TRUE), .groups = "drop")
+  ggplot(d, aes(factor(n_components), modularity, fill = method)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    scale_fill_manual(values = METHOD_COLOURS, name = "Method") +
+    labs(title = "Graph modularity (best per component count)",
+         subtitle = "Higher is better",
+         x = "Components / rank", y = "Modularity") +
+    .bench_theme()
+}
+
+# Silhouette distribution (per method)
+plot_silhouette_dist <- function(clust_df) {
+  ggplot(clust_df, aes(method, mean_silhouette, fill = method)) +
+    geom_violin(alpha = 0.4, color = NA) +
+    geom_boxplot(width = 0.18, outlier.size = 0.5) +
+    scale_fill_manual(values = METHOD_COLOURS, name = "Method") +
+    labs(title = "Mean silhouette distribution",
+         subtitle = "Across all parameter combinations; higher is better",
+         x = NULL, y = "Mean silhouette") +
+    .bench_theme() + theme(legend.position = "none")
+}
+
+# DBI barplot (lower = better)
+plot_dbi_bar <- function(clust_df) {
+  d <- clust_df %>% dplyr::group_by(method) %>%
+    dplyr::summarise(DBI = stats::median(DBI, na.rm = TRUE), .groups = "drop")
+  ggplot(d, aes(method, DBI, fill = method)) +
+    geom_col(width = 0.6) +
+    scale_fill_manual(values = METHOD_COLOURS, name = "Method") +
+    labs(title = "Davies-Bouldin index (median)",
+         subtitle = "Lower is better", x = NULL, y = "DBI") +
+    .bench_theme() + theme(legend.position = "none")
+}
+
+# Combined summary panel
+# plot_summary_panel <- function(decomp_df, clust_df) {
+#   (plot_frv(decomp_df) | plot_ari_facet(clust_df)) /
+#     (plot_modularity_bar(clust_df) | plot_silhouette_dist(clust_df) | plot_dbi_bar(clust_df)) +
+#     patchwork::plot_annotation(
+#       title = "AUCell matrix: PCA vs NMF low-dimensional benchmark",
+#       theme = theme(plot.title = element_text(face = "bold", size = 15)))
+# }
+plot_summary_panel <- function(decomp_df, clust_df) {
+  top_row <- (plot_frv(decomp_df) | plot_ari_facet(clust_df)) +
+    patchwork::plot_layout(widths = c(1, 2))
+
+  bottom_row <- plot_modularity_bar(clust_df) |
+    plot_silhouette_dist(clust_df) |
+    plot_dbi_bar(clust_df)
+
+  (top_row / bottom_row) +
+    patchwork::plot_annotation(
+      title = "AUCell matrix: PCA vs NMF low-dimensional benchmark",
+      theme = theme(plot.title = element_text(face = "bold", size = 15))
+    )
+}
+
+```
+
+```{r parameter-selection}
+# -----------------------------------------------------------------------------
+# Composite ranking. Each metric is min-max normalised across all rows and
+# oriented so that higher = better; FRV/DBI are inverted; n_clusters is
+# penalised for being extreme relative to the reference's class count.
+# This produces a RANKING, not a verdict of absolute superiority.
+# -----------------------------------------------------------------------------
+select_best_parameters <- function(clust_df, decomp_df, reference,
+                                    weights = c(FRV = 1, ARI = 1, silhouette = 1,
+                                                DBI = 1, modularity = 1,
+                                                ncluster = 0.5)) {
+  norm01 <- function(x) {
+    r <- range(x, na.rm = TRUE)
+    if (diff(r) == 0) return(rep(0.5, length(x)))
+    (x - r[1]) / diff(r)
+  }
+  ref_k <- length(unique(reference))
+
+  df <- clust_df %>%
+    dplyr::left_join(dplyr::select(decomp_df, method, n_components, FRV),
+                     by = c("method", "n_components")) %>%
+    dplyr::mutate(
+      s_FRV        = 1 - norm01(FRV),
+      s_ARI        = norm01(ARI),
+      s_silhouette = norm01(mean_silhouette),
+      s_DBI        = 1 - norm01(DBI),
+      s_modularity = norm01(modularity),
+      s_ncluster   = 1 - norm01(abs(n_clusters - ref_k)),
+      composite =
+        (weights["FRV"]        * s_FRV +
+         weights["ARI"]        * s_ARI +
+         weights["silhouette"] * s_silhouette +
+         weights["DBI"]        * s_DBI +
+         weights["modularity"] * s_modularity +
+         weights["ncluster"]   * s_ncluster) / sum(weights)
+    ) %>%
+    dplyr::arrange(dplyr::desc(composite))
+
+  df
+}
+
+# Cautious, metric-scoped summary statement
+summarise_outcome <- function(ranking) {
+  best   <- ranking[1, ]
+  by_m   <- ranking %>% dplyr::group_by(method) %>%
+    dplyr::summarise(mean_composite = mean(composite, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(mean_composite))
+  leader <- by_m$method[1]
+  msg <- sprintf(
+    paste0("Under the tested AUCell matrix and parameter grid, %s showed the ",
+           "higher composite decomposition/clustering-geometry score ",
+           "(mean composite: %s). Best single configuration: %s with %d ",
+           "components, k_param=%d, resolution=%.2f (composite=%.3f). ",
+           "This reflects clustering geometry and reference-label agreement on ",
+           "the tested grid only and does not establish biological superiority."),
+    leader,
+    paste(sprintf("%s=%.3f", by_m$method, by_m$mean_composite), collapse = ", "),
+    best$method, best$n_components, best$k_param, best$resolution, best$composite)
+  cat("\n", strwrap(msg, width = 90), sep = "\n")
+  invisible(by_m)
+}
+```
+
+```{r master-runner}
+# -----------------------------------------------------------------------------
+# End-to-end driver. Writes the three CSVs and returns all objects.
+# -----------------------------------------------------------------------------
+run_aucell_pca_nmf_benchmark <- function(seurat_obj = SEURAT_OBJ,
+                                         out_prefix = OUT_PREFIX) {
+  check_dependencies()
+  set.seed(SEED)
+
+  raw  <- extract_assay_matrix(seurat_obj, ASSAY, SLOT)
+  mat  <- prepare_benchmark_matrix(raw)
+  ref  <- get_reference_label(seurat_obj, colnames(mat), REFERENCE_LABEL)
+
+  dec  <- run_decomposition_benchmark(mat)
+  clu  <- run_clustering_benchmark(dec$embeddings, ref)
+  long <- assemble_all_metrics_long(dec$decomposition, clu)
+  rank <- select_best_parameters(clu, dec$decomposition, ref)
+
+  # --- write CSVs ---
+  write.csv(dec$decomposition,
+            paste0(out_prefix, "_decomposition_metrics.csv"), row.names = FALSE)
+  write.csv(clu,
+            paste0(out_prefix, "_clustering_metrics.csv"), row.names = FALSE)
+  write.csv(long,
+            paste0(out_prefix, "_all_metrics_long.csv"), row.names = FALSE)
+  write.csv(rank,
+            paste0(out_prefix, "_ranking.csv"), row.names = FALSE)
+  cat(sprintf("\n[write] CSVs written with prefix '%s'\n", out_prefix))
+
+  list(matrix = mat, reference = ref, decomposition = dec$decomposition,
+       embeddings = dec$embeddings, clustering = clu, long = long, ranking = rank)
+}
+```
+
+```{r execute, fig.width=16, fig.height=9, message=FALSE, warning=FALSE}
+res <- run_aucell_pca_nmf_benchmark()
+
+cat("\n--- Decomposition metrics ---\n");        print(res$decomposition)
+cat("\n--- Clustering metrics (head) ---\n");     print(utils::head(res$clustering, 12))
+
+# Plots
+panel <- plot_summary_panel(res$decomposition, res$clustering)
+print(panel)
+ggsave(paste0(OUT_PREFIX, "_summary_panel.pdf"), panel,
+       width = 16, height = 9, dpi = 150)
+
+# Cautious, metric-scoped outcome statement + ranking head
+summarise_outcome(res$ranking)
+cat("\n--- Top configurations by composite score ---\n")
+print(utils::head(res$ranking[, c("method","n_components","k_param","resolution",
+                                  "ARI","mean_silhouette","DBI","modularity",
+                                  "n_clusters","composite")], 10))
+```
+
+
+```{r}
+save.image("Final_AUCell_PCA_NMF_Benchmark.Rdata")
+```
+

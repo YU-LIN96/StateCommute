@@ -1,0 +1,929 @@
+---
+title: "Circle_plot_etc"
+author: "Yu"
+date: "2026-05-18"
+output: html_document
+---
+
+```{r}
+library(cluster)
+library(Seurat)
+library(ggplot2)
+library(SeuratWrappers)
+library(RcppML)
+
+library(msigdbr)
+library(dbplyr)
+library(tidydr)
+library(tidyverse)
+library(Matrix)
+```
+
+
+
+```{r}
+load("MAY.merge.obj.final.obj.final.obj.Rdata")
+```
+
+
+
+```{r all cell Dimplot}
+celltype_order <- c(
+  "Excitatory_Neurons", "Oligodendrocytes", "Astrocytes","Inhibitory_Neurons", "Microglia",
+  "Endothelial_Cells", "VLMC", "OPCs","Myeloid", "Lymphoid"
+)
+
+merge.obj.final.obj$annotation3 <- factor(merge.obj.final.obj$annotation3, levels = celltype_order)
+```
+
+
+```{r all cell Dimplot}
+p <- DimPlot(
+  merge.obj.final.obj,
+  reduction = "umap",
+  group.by  = "annotation3",
+  label     = T,
+  pt.size   = 0.01,
+  label.size = 8
+) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_blank(),
+    plot.margin     = margin(5, 5, 5, 5)
+  )
+
+pdf("./Figure_Final/annotation.pdf", height = 10, width = 10)
+print(p)
+dev.off()
+```
+
+
+
+```{r testing some markers}
+DimPlot(
+  merge.obj.final.obj,
+  reduction = "umap",
+  group.by  = "annotation2",
+  label     = T,
+  pt.size   = 0.1
+)
+
+
+genes <- c(
+  "Slc17a7", "Camk2b",
+  "Mog", "Mag",
+  "Aqp4", "Slc1a3",
+  "Gad1", "Gad2",
+  "P2ry12","Trem2",  #MG
+  "Pecam1", "Cldn5",
+  "Dcn", "Vtn",
+  "Cspg4", "Vcan",
+  "H2-Aa","Mrc1",
+  "Cd3e", "Nkg7"
+)
+Idents(merge.obj.final.obj) <- "annotation2"
+DotPlot(
+  merge.obj.final.obj,
+  features   = genes,
+  group.by   = "annotation2",
+  col.min    = 0,
+  dot.min    = 0.10
+)+
+  scale_colour_gradient(low = "white", high = "blue") +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 14),
+    axis.text.y  = element_text(size = 14),
+    legend.text  = element_text(size = 14),
+    legend.title = element_text(size = 14)
+  )
+
+vascular_fibro_mural_markers <- c(
+  # endothelial
+  "Pecam1", "Cldn5", "Kdr", "Flt1", "Slco1c1",
+  
+  # pericyte / mural
+  "Pdgfrb", "Rgs5", "Cspg4", "Abcc9", "Kcnj8", "Notch3", "Des",
+  
+  # smooth muscle
+  "Acta2", "Tagln", "Myh11",
+  
+  # VLMC / fibroblast-like
+  "Dcn", "Lum", "Col1a1", "Col1a2", "Col3a1", "Pdgfra", "Vtn"
+)
+
+DotPlot(
+  merge.obj.final.obj,
+  features   = vascular_fibro_mural_markers,
+  group.by   = "annotation2",
+  col.min    = 0,
+  dot.min    = 0.10
+)+
+  scale_colour_gradient(low = "white", high = "blue") +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 14),
+    axis.text.y  = element_text(size = 14),
+    legend.text  = element_text(size = 14),
+    legend.title = element_text(size = 14)
+  )
+```
+
+
+
+
+```{r Extract colors}
+# Extract the mapping between cell types and colors
+plot_data <- ggplot_build(p)$data[[1]]
+color_mapping <- unique(plot_data[, c("group", "colour")])
+
+# Map group IDs back to original annotation levels
+label_levels <- levels(as.factor(merge.obj.final.obj$annotation3))
+color_mapping$label <- label_levels[color_mapping$group]
+
+# Format as a named vector for easy reuse
+final_colors <- setNames(color_mapping$colour, color_mapping$label)
+
+# View the results
+print(final_colors)
+```
+
+
+```{r all cell marker dot plot}
+
+genes <- c(
+  "Slc17a7", "Camk2b",
+  "Mog", "Mag",
+  "Aqp4", "Slc1a3",
+  "Gad1", "Gad2",
+  "P2ry12","Trem2",  #MG
+  "Pecam1", "Cldn5",
+  "Dcn", "Vtn",
+  "Cspg4", "Vcan",
+  "H2-Aa","Mrc1",
+  "Cd3e", "Nkg7"
+)
+pdf("./Figure_Final/markers.dotplot.pdf", height = 5, width = 10)
+
+p <- DotPlot(
+  merge.obj.final.obj,
+  features   = genes,
+  group.by   = "annotation3",
+  col.min    = 0,
+  dot.min    = 0.10
+) +
+  scale_colour_gradient(low = "white", high = "blue") +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 14),
+    axis.text.y  = element_text(size = 14),
+    legend.text  = element_text(size = 14),
+    legend.title = element_text(size = 14)
+  )
+print(p)
+dev.off()
+```
+
+
+
+```{r circle plot}
+merge.obj.final.obj$index <- paste(merge.obj.final.obj$orig.ident, merge.obj.final.obj$annotation3,sep="_")
+
+exp_mat <- AverageExpression(merge.obj.final.obj,group.by="index")
+
+exp_mat <- as.data.frame(exp_mat[[1]])
+
+cell_count <- table(merge.obj.final.obj$index)
+
+var_genes <- VariableFeatures(merge.obj.final.obj)
+```
+
+
+```{r circle plot}
+plan("multisession", workers = 4) 
+
+# 2. Increase the maximum size of data that can be exported to workers (e.g., 8GB)
+options(future.globals.maxSize = 25 * 1024**3)
+
+# 3. Run FindAllMarkers as usual
+
+markers <-  FindAllMarkers(merge.obj.final.obj,group.by="annotation3", min.pct=0.1,only.pos = T)
+
+plan("sequential")
+save(markers,exp_mat,cell_count,var_genes,file="average_expression_matrix.Rdata")
+```
+
+
+
+```{r}
+library(circlize)
+library(dendextend)
+library(stringr)
+```
+
+
+```{r circle plot}
+sample_annot <- data.frame(
+  TimePoint = rep("Chronic", ncol(exp_mat)),
+  COndition = rep("Disease", ncol(exp_mat)),
+  CellType  = rep("Unknown", ncol(exp_mat)),
+  CellCount = as.vector(cell_count[gsub("-", "_", colnames(exp_mat))]),
+  Dataset   = "VEEV"
+)
+rownames(sample_annot) <- colnames(exp_mat)
+
+sample_annot$TimePoint[grep("7d|24h",            rownames(sample_annot))] <- "Acute"
+sample_annot$COndition[grep("Control|Mock|Sham",  rownames(sample_annot))] <- "Control"
+# 1. Create the CellType column by joining the 4th and 5th elements
+sample_annot$CellType <- paste(
+  str_split(rownames(sample_annot), "-", simplify = TRUE)[, 4],
+  str_split(rownames(sample_annot), "-", simplify = TRUE)[, 5],
+  sep = "_"
+)
+# 2. Remove the trailing underscore using a regular expression
+# '$' matches the end of the string
+sample_annot$CellType <- str_remove(sample_annot$CellType, "_$")
+
+
+sample_annot$Dataset[grep("TBI",  rownames(sample_annot))] <- "TBI"
+sample_annot$Dataset[grep("OPNA", rownames(sample_annot))] <- "OPNA"
+
+# Fix any remaining NA CellCounts
+sample_annot$CellCount[is.na(sample_annot$CellCount)] <- 0
+
+marker_list <- c()
+for (i in unique(markers$cluster)) {
+  tmp <- markers[which(markers$cluster == i), ]
+  marker_list <- c(marker_list, tmp$gene[1:50])
+}
+
+# Clustering — exp_mat now has exactly ncol = nrow(sample_annot)
+sample_dist    <- dist(1 - cor(exp_mat[unique(marker_list), ]), method = "euclidean")
+sample_cluster <- hclust(sample_dist, method = "ward.D2")
+dend           <- as.dendrogram(sample_cluster)
+max_height     <- attr(dend, "height")
+
+sample_order         <- order.dendrogram(dend)
+sample_annot_ordered <- sample_annot[sample_order, ]
+
+n <- nrow(sample_annot_ordered)
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+colors_time <- c(
+  "Acute"   = "#0072B2",
+  "Chronic" = "#E69F00"
+)
+
+colors_disease <- c(
+  "Control" = "#b1a9e5",
+  "Disease" = "#6A5ACD"
+)
+
+
+# extract the color to make it consitent with the Dimplot
+colors_celltype <- c(
+  "Astrocytes"       = "#A3A500",
+  "Excitatory_Neurons"       = "#F8766D",
+  "Inhibitory_Neurons"       = "#39B600",
+  "Oligodendrocytes" = "#D89000",
+  "OPCs"             = "#9590FF",
+  "Myeloid"          = "#E76BF3",
+  "Lymphoid"         = "#FF62BC",
+  "Microglia"        = "#00BF7D",
+  "VLMC"      = "#00B0F6",
+  "Endothelial_Cells"         = "#00BFC4"
+)
+
+colors_dataset <- c(
+  "VEEV" = "#CD5C5C",
+  "TBI" = "#5b94cd",
+  "OPNA" = "#5bcd94"
+)
+pdf("./Figure_Final/circos_plot.pdf", width = 12, height = 12)
+
+# ── Circos ────────────────────────────────────────────────────────────────────
+circos.clear()
+circos.par(
+  start.degree = 0,
+  gap.after    = 60,
+  cell.padding = c(0, 0, 0, 0)
+)
+circos.initialize(factors = "a", xlim = c(0, n))
+
+max_count <- max(sample_annot_ordered$CellCount, na.rm = TRUE)
+
+# 1️⃣ Cell count bars
+circos.track(ylim = c(0, max_count), panel.fun = function(x, y) {
+  for (i in 1:n) {
+    value <- sample_annot_ordered$CellCount[i]
+    if (is.na(value)) value <- 0
+    circos.rect(i - 0.8, 0, i - 0.2, value, col = "#69b3a2", border = NA)
+  }
+}, track.height = 0.15, bg.border = NA)
+
+# 2️⃣ Cell type
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  for (i in 1:n) {
+    circos.rect(i - 1, 0, i, 1,
+                col    = colors_celltype[as.character(sample_annot_ordered$CellType[i])],
+                border = "black")
+  }
+}, track.height = 0.06, bg.border = NA)
+
+# 3️⃣ Dataset
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  for (i in 1:n) {
+    circos.rect(i - 1, 0, i, 1,
+                col    = colors_dataset[as.character(sample_annot_ordered$Dataset[i])],
+                border = "black")
+  }
+}, track.height = 0.06, bg.border = NA)
+
+# 4️⃣ Disease
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  for (i in 1:n) {
+    circos.rect(i - 1, 0, i, 1,
+                col    = colors_disease[as.character(sample_annot_ordered$COndition[i])],
+                border = "black")
+  }
+}, track.height = 0.06, bg.border = NA)
+
+# 5️⃣ Time point
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  for (i in 1:n) {
+    circos.rect(i - 1, 0, i, 1,
+                col    = colors_time[as.character(sample_annot_ordered$TimePoint[i])],
+                border = "black")
+  }
+}, track.height = 0.06, bg.border = NA)
+
+# 6️⃣ Dendrogram (innermost)
+circos.track(
+  ylim         = c(0, max_height),
+  track.height = 0.45,
+  bg.border    = NA,
+  panel.fun    = function(x, y) {
+    circos.dendrogram(dend, facing = "outside",
+                      max_height = max_height, use_x_attr = FALSE)
+  }
+)
+
+# ── Legends ───────────────────────────────────────────────────────────────────
+legend("bottomleft",  legend = names(colors_time),     fill = colors_time,
+       title = "Time Point", cex = 0.8, bty = "n")
+legend("topright",    legend = names(colors_disease),  fill = colors_disease,
+       title = "Disease",    cex = 0.8, bty = "n")
+legend("bottomright", legend = names(colors_celltype), fill = colors_celltype,
+       title = "Cell Type",  cex = 0.8, bty = "n")
+legend("topleft",     legend = names(colors_dataset),  fill = colors_dataset,
+       title = "Dataset",    cex = 0.8, bty = "n")
+
+circos.clear()
+dev.off()
+```
+
+```{r}
+write.csv(sample_annot_ordered, file = "circleplot.data.sample_annot_ordered.csv")
+```
+
+
+
+####################################################################
+# Differential Abundance
+####################################################################
+
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(dplyr)
+library(ggplot2)
+
+library(ggplot2)
+library(ggbeeswarm)
+```
+
+
+
+```{r}
+meta <- merge.obj.final.obj@meta.data
+meta$Dataset   <- sub("_.*", "", meta$orig.ident)
+meta$Condition <- sapply(strsplit(meta$orig.ident, "_"), `[`, 2)
+meta$TimePoint <- sapply(strsplit(meta$orig.ident, "_"), `[`, 3)
+meta$Phase <- ifelse(meta$TimePoint %in% c("24h", "7d"), "Acute", "Chronic")
+meta$Group <- ifelse(
+  meta$Condition %in% c("Control", "Sham", "Mock"), "Control", "Treated"
+)
+merge.obj.final.obj@meta.data <- meta
+
+merge.obj.final.obj$miloR <- merge.obj.final.obj$orig.ident
+merge.obj.final.obj$miloR[which(merge.obj.final.obj$Group == "Control")] <- "Control"
+merge.obj.final.obj$miloR <- paste0(merge.obj.final.obj$miloR, 1:2)
+```
+
+
+
+```{r}
+result <- list(Acute = list(), Chronic = list())
+object <- list(Acute = list(), Chronic = list())
+
+for (i in c("Acute", "Chronic")) {
+  for (j in c("VEEV", "TBI", "OPNA")) {
+    cat(i, j, "\n")
+    
+    sce <- as.SingleCellExperiment(
+      merge.obj.final.obj[, which(merge.obj.final.obj$Phase == i & merge.obj.final.obj$Dataset == j)]
+    )
+    
+    sce <- logNormCounts(sce)
+    
+    milo_obj <- Milo(sce)
+    
+    milo_obj <- buildGraph(milo_obj, k = 30, d = 30, reduced.dim = "HARMONY")
+    
+    milo_obj <- makeNhoods(milo_obj, prop = 0.1, k = 30, d = 30, refined = TRUE,
+                           reduced_dims = "HARMONY")
+    
+    plotNhoodSizeHist(milo_obj)
+    
+    milo_obj <- countCells(milo_obj, meta.data = data.frame(colData(milo_obj)),
+                           samples = "miloR")
+    
+    # Define experimental design
+    design <- as.data.frame(xtabs(~ Group + miloR, data = data.frame(colData(milo_obj))))
+    design <- design[design$Freq > 0, ]
+    rownames(design) <- design$miloR
+    design <- design[colnames(nhoodCounts(milo_obj)), ]
+    
+    milo.res <- testNhoods(milo_obj, design = ~Group, design.df = design)
+    
+    milo.res <- annotateNhoods(milo_obj, milo.res, coldata_col = "annotation3")
+    
+    result[[i]][[j]] <- milo.res
+    object[[i]][[j]] <- milo_obj
+    
+    pdf(paste("./Figure_Final/",i, j, ".pdf", sep = "_"))
+    p <- plotDAbeeswarm(milo.res, group.by = "annotation3")
+    print(p)
+    dev.off()
+  }
+}
+
+save(result, object, file = "Result.Rdata")
+```
+
+
+
+
+
+```{r}
+load("Result.Rdata")
+```
+
+
+```{r}
+plot_data <- list(Acute = list(), Chronic = list())
+fig <- plot_data
+
+for (i in names(result)) {
+  for (j in names(result[[1]])) {
+    cat(i, j, "\n")
+    
+    df <- as.data.frame(result[[i]][[j]])
+    df <- df[!df$annotation3 %in% c("Lymphoid","Myeloid"),]
+    
+    plot_data[[i]][[j]] <- df
+    
+    ave <- tapply(plot_data[[i]][[j]]$logFC, plot_data[[i]][[j]]$annotation3, median)
+    
+    plot_data[[i]][[j]]$annotation3 <- factor(
+      plot_data[[i]][[j]]$annotation3,
+      levels = names(sort(ave))
+    )
+    
+    fig[[i]][[j]] <- ggplot(plot_data[[i]][[j]], aes(x = annotation3, y = logFC)) +
+      geom_quasirandom(aes(color = logFC),
+                       size = 0.8, alpha = 1, width = 0.6) +
+      geom_boxplot(width = 0.5, alpha = 1, outlier.shape = NA, fill = "white") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.7) +
+      coord_flip() +
+      scale_color_gradient2(
+        low = "#bd3030",
+        mid = "grey90",
+        high = "#483d8b",
+        midpoint = 0,
+        name = "LogFC"
+      ) +
+      labs(
+        title = paste(i, j),
+        x = "",
+        y = "Log Fold Change"
+      ) +
+      theme(
+        panel.border = element_rect(fill = NA),
+        panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.grid = element_line(color = "grey90"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        axis.text.x = element_text(size = 10, color = "black"),
+        legend.position = "none"
+      )
+  }
+}
+
+pdf("./Figure_Final/DA_beeswarm.new.pdf", height = 12, width = 18)
+print(cowplot::plot_grid(
+  fig[["Acute"]][["VEEV"]], fig[["Acute"]][["TBI"]], fig[["Acute"]][["OPNA"]],
+  fig[["Chronic"]][["VEEV"]], fig[["Chronic"]][["TBI"]], fig[["Chronic"]][["OPNA"]],
+  ncol = 3
+))
+dev.off()
+```
+
+
+
+```{r}
+library(ggplot2)
+library(ggbeeswarm)
+library(cowplot)
+```
+
+
+```{r}
+plot_data <- list(Acute = list(), Chronic = list())
+fig <- plot_data
+
+celltype_abbrev <- c(
+  "Astrocytes"           = "AST",
+  "Excitatory_Neurons"   = "EXC",
+  "Inhibitory_Neurons"   = "INH",
+  "Oligodendrocytes"     = "OD",
+  "OPCs"                 = "OPC",
+  "Microglia"            = "MG",
+  "Vascular_Cells"       = "END",
+  "Fibroblasts"          = "VLMC"
+)
+
+plot_data <- list(Acute = list(), Chronic = list())
+fig <- plot_data
+
+for (i in names(result)) {
+  for (j in names(result[[i]])) {
+    cat(i, j, "\n")
+    
+    df <- as.data.frame(result[[i]][[j]])
+    
+    # remove unwanted populations before abbreviation
+    df <- df[!df$annotation2 %in% c("Lymphoid", "Myeloid"), ]
+    
+    # replace annotation2 with abbreviated names
+    df$annotation2 <- as.character(df$annotation2)
+    idx <- df$annotation2 %in% names(celltype_abbrev)
+    df$annotation2[idx] <- celltype_abbrev[df$annotation2[idx]]
+    
+    # store data
+    plot_data[[i]][[j]] <- df
+    
+    # order cell types by median logFC
+    ave <- tapply(
+      plot_data[[i]][[j]]$logFC,
+      plot_data[[i]][[j]]$annotation2,
+      median,
+      na.rm = TRUE
+    )
+    
+    celltype_order <- names(sort(ave))
+    
+    plot_data[[i]][[j]]$annotation2 <- factor(
+      plot_data[[i]][[j]]$annotation2,
+      levels = celltype_order
+    )
+    
+    # plot
+    fig[[i]][[j]] <- ggplot(
+  plot_data[[i]][[j]],
+  aes(x = annotation2, y = logFC)
+) +
+  geom_quasirandom(
+    aes(color = logFC),
+    size = 0.8,
+    alpha = 1,
+    width = 0.6
+  ) +
+  geom_boxplot(
+    width = 0.5,
+    alpha = 1,
+    outlier.shape = NA,
+    fill = "white"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "black",
+    alpha = 0.7
+  ) +
+  coord_flip() +
+  scale_color_gradient2(
+    low = "#bd3030",
+    mid = "grey90",
+    high = "#483d8b",
+    midpoint = 0,
+    name = "LogFC"
+  ) +
+  labs(
+    title = paste(i, j),
+    x = "",
+    y = "Log Fold Change"
+  ) +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black"),
+    panel.background = element_blank(),
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 22
+    ),
+    axis.title.x = element_text(
+      size = 20,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 20,
+      color = "black"
+    ),
+    panel.grid = element_line(color = "grey90"),
+    axis.text.y = element_text(size = 25, color = "black"),
+    axis.text.x = element_text(size = 15, color = "black"),
+    legend.position = "none"
+  )
+  }
+}
+
+
+pdf("./Figure_Final/DA_beeswarm.new.test.pdf", height = 12, width = 18)
+print(
+  cowplot::plot_grid(
+    fig[["Acute"]][["VEEV"]],
+    fig[["Acute"]][["TBI"]],
+    fig[["Acute"]][["OPNA"]],
+    fig[["Chronic"]][["VEEV"]],
+    fig[["Chronic"]][["TBI"]],
+    fig[["Chronic"]][["OPNA"]],
+    ncol = 3
+  )
+)
+dev.off()
+```
+
+
+
+
+
+
+```{r}
+library(reshape2)
+```
+
+
+
+```{r}
+meta <- merge.obj.final.obj@meta.data
+meta$Dataset   <- sub("_.*", "", meta$orig.ident)
+meta$Condition <- sapply(strsplit(meta$orig.ident, "_"), `[`, 2)
+meta$Group <- ifelse(
+  meta$Condition %in% c("Control", "Sham", "Mock"), "Control", "Treated"
+)
+merge.obj.final.obj@meta.data <- meta
+
+merge.obj.final.obj$class <- merge.obj.final.obj$Dataset
+# merge.obj.final.obj$class[which(merge.obj.final.obj$Group == "Control")] <- "Control"
+
+celltype_order <- c(
+  "Excitatory_Neurons", "Oligodendrocytes", "Astrocytes","Inhibitory_Neurons", "Microglia",
+  "Endothelial_Cells", "VLMC", "OPCs","Myeloid", "Lymphoid"
+)
+
+# group_colors <- c("#CD5C5C", "#5b94cd", "#5bcd94", "#b1a9e5")
+group_colors <- c("#CD5C5C", "#5b94cd", "#5bcd94")
+
+# Plot cell number
+dat_num <- table(merge.obj.final.obj$class, merge.obj.final.obj$annotation3)
+plot.data <- melt(t(dat_num))
+plot.data$value <- plot.data$value / 1e4  # ← divide by 10^4
+# plot.data$Var2 <- factor(plot.data$Var2, levels = c("VEEV", "TBI", "OPNA", "Control"))
+plot.data$Var2 <- factor(plot.data$Var2, levels = c("VEEV", "TBI", "OPNA"))
+plot.data$Var1 <- factor(plot.data$Var1, levels = celltype_order)
+
+plot.data <- plot.data[!plot.data$Var1 %in% c("Myeloid", "Lymphoid"),]
+
+p1 <- ggplot(plot.data, aes(x = Var1, y = value, fill = Var2)) +
+  geom_bar(stat = "identity") +
+  xlab("") + ylab(expression("Number of cells (" %*% 10^4 ~ ")")) +  # ← updated label
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 13, angle = 45, vjust = 1, hjust = 1, color = "black"),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(name = "", values = group_colors)
+
+# Plot cell fraction
+dat_frac <- as.data.frame(table(merge.obj.final.obj$class, merge.obj.final.obj$annotation3))
+count <- tapply(dat_frac$Freq, dat_frac$Var2, sum)
+dat_frac$fraction <- dat_frac$Freq / rep(count, each = 3)
+# dat_frac$Var1 <- factor(dat_frac$Var1, levels = c("VEEV", "TBI", "OPNA", "Control"))
+dat_frac$Var1 <- factor(dat_frac$Var1, levels = c("VEEV", "TBI", "OPNA"))
+dat_frac$Var2 <- factor(dat_frac$Var2, levels = celltype_order)
+
+dat_frac <- dat_frac[!dat_frac$Var2 %in% c("Myeloid", "Lymphoid"),]
+
+p2 <- ggplot(dat_frac, aes(x = Var2, y = fraction, fill = Var1)) +
+  geom_bar(stat = "identity") +
+  xlab("") + ylab("Fraction of cells") +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 13, angle = 45, vjust = 1, hjust = 1, color = "black"),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(name = "", values = group_colors)
+
+pdf("./Figure_Final/Fig2_cell.number.and.fraction.pdf", width = 16, height = 7)
+print(cowplot::plot_grid(p2, p1, ncol = 2))
+dev.off()
+```
+
+
+
+
+```{r}
+## -------------------------------
+## Plot cell-type proportion normalized within each dataset
+## -------------------------------
+
+dat_prop <- as.data.frame(
+  table(
+    merge.obj.final.obj$class,
+    merge.obj.final.obj$annotation3
+  )
+)
+
+colnames(dat_prop) <- c("Dataset", "Celltype", "Freq")
+
+## factor order
+dat_prop$Dataset <- factor(dat_prop$Dataset, levels = c("VEEV", "TBI", "OPNA"))
+dat_prop$Celltype <- factor(dat_prop$Celltype, levels = celltype_order)
+
+## denominator: total cells within each dataset
+dataset_total <- tapply(dat_prop$Freq, dat_prop$Dataset, sum)
+
+dat_prop$dataset_total <- dataset_total[as.character(dat_prop$Dataset)]
+
+dat_prop$fraction_within_dataset <- dat_prop$Freq / dat_prop$dataset_total
+
+## remove unwanted cell types after normalization
+dat_prop <- dat_prop[!dat_prop$Celltype %in% c("Myeloid", "Lymphoid"), ]
+
+p3 <- ggplot(
+  dat_prop,
+  aes(x = Celltype, y = fraction_within_dataset, fill = Dataset)
+) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.8),
+    width = 0.75
+  ) +
+  xlab("") +
+  ylab("Fraction within each dataset") +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(
+      size = 13,
+      angle = 45,
+      vjust = 1,
+      hjust = 1,
+      color = "black"
+    ),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(name = "", values = group_colors)
+
+p3
+```
+
+
+
+
+```{r}
+## -------------------------------
+## P4: fraction-of-normalized-proportions
+## First normalize within each dataset, then stack/percentage across datasets
+## -------------------------------
+
+## dat_prop should already contain:
+## Dataset, Celltype, Freq, dataset_total, fraction_within_dataset
+
+dat_p4 <- dat_prop
+
+## For each cell type, calculate the total normalized proportion across datasets
+celltype_total_prop <- tapply(
+  dat_p4$fraction_within_dataset,
+  dat_p4$Celltype,
+  sum,
+  na.rm = TRUE
+)
+
+dat_p4$celltype_total_prop <- celltype_total_prop[as.character(dat_p4$Celltype)]
+
+## Now calculate fraction of proportions
+dat_p4$fraction_of_proportions <- dat_p4$fraction_within_dataset / dat_p4$celltype_total_prop
+
+## keep factor order
+dat_p4$Dataset <- factor(dat_p4$Dataset, levels = c("VEEV", "TBI", "OPNA"))
+dat_p4$Celltype <- factor(dat_p4$Celltype, levels = celltype_order)
+
+## remove unwanted cell types if not already removed
+dat_p4 <- dat_p4[!dat_p4$Celltype %in% c("Myeloid", "Lymphoid"), ]
+
+p4 <- ggplot(
+  dat_p4,
+  aes(x = Celltype, y = fraction_of_proportions, fill = Dataset)
+) +
+  geom_bar(stat = "identity") +
+  xlab("") +
+  ylab("Fraction of normalized proportions") +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(
+      size = 13,
+      angle = 45,
+      vjust = 1,
+      hjust = 1,
+      color = "black"
+    ),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_fill_manual(name = "", values = group_colors)
+
+p4
+```
+
+
+```{r}
+pdf(
+  "./Figure_Final/Fig2_cell.number.fraction.dataset.normalized.and.normalized.stack.pdf",
+  width = 16,
+  height = 14
+)
+
+print(
+  cowplot::plot_grid(
+    p1, p2,
+    p3, p4,
+    ncol = 2,
+    labels = c("A", "B", "C", "D"),
+    label_size = 18
+  )
+)
+
+dev.off()
+```
+
+
+```{r}
+save.image("Figure2.Final.Rdata")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

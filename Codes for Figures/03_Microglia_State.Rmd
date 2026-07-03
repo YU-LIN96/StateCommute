@@ -1,0 +1,263 @@
+---
+title: "Untitled"
+author: "Yu"
+date: "2026-06-02"
+output: html_document
+---
+
+```{r}
+library(cluster)
+library(Seurat)
+library(ggplot2)
+library(SeuratWrappers)
+library(RcppML)
+
+library(msigdbr)
+library(dbplyr)
+library(tidydr)
+library(tidyverse)
+library(Matrix)
+```
+
+
+
+
+```{r}
+# from script "/INTEGRATE/1_ANNOTATION/YL_annotation2.Rmd"
+load("./INTEGRATE/1_ANNOTATION/merge_obj_filtered.annotation2.Rdata") # merge_obj_filtered
+```
+
+
+
+```{r}
+merge_obj_filtered$annotation2_refined <- as.character(merge_obj_filtered$annotation2)
+merge_obj_filtered$annotation2_refined[merge_obj_filtered$annotation2_refined == "Vascular_Cells"] <- "Endothelial_Cells"
+merge_obj_filtered$annotation2_refined[merge_obj_filtered$annotation2_refined == "Fibroblasts"] <- "VLMC"
+```
+
+
+```{r transform some inh to exc}
+DimPlot(
+  merge_obj_filtered,
+  reduction = "umap",
+  group.by  = "annotation2_refined",
+  label     = T,
+  pt.size   = 0.01,
+  label.size = 8
+) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_blank(),
+    plot.margin     = margin(5, 5, 5, 5)
+  )
+
+
+DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "annotation2_refined",
+        label     = T)
+FeaturePlot(merge_obj_filtered, features = c("Gad2"))
+FeaturePlot(merge_obj_filtered, features = c("Slc17a7"))
+DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "orig.ident")
+DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "seurat_clusters",label = T)
+
+```
+
+```{r transform some inh to exc}
+Idents(merge_obj_filtered) <- "seurat_clusters"
+merge_obj_filtered <- FindSubCluster(merge_obj_filtered,cluster = 4,graph.name = "RNA_snn",resolution = 0.2)
+```
+
+```{r}
+DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "sub.cluster",
+        label     = T)
+```
+
+
+
+```{r}
+table(merge_obj_filtered$orig.ident,merge_obj_filtered$sub.cluster)
+```
+
+
+```{r}
+merge_obj_filtered$annotation3 <- as.character(merge_obj_filtered$annotation2_refined)
+
+merge_obj_filtered$annotation3[merge_obj_filtered$sub.cluster == "4_0"] <- "Excitatory_Neurons"
+```
+
+
+```{r}
+DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "annotation3",
+        label     = T)
+```
+
+```{r}
+table(merge_obj_filtered$orig.ident,merge_obj_filtered$annotation3)
+```
+
+```{r}
+p <- DimPlot(merge_obj_filtered,reduction = "umap",
+        group.by  = "annotation3",
+        label     = T)
+
+refine3_cells <- CellSelector(p)
+
+merge_obj_filtered$annotation3[refine3_cells] <- "Excitatory_Neurons"
+```
+
+
+```{r}
+merge.obj.final.obj <- merge_obj_filtered
+
+save(merge.obj.final.obj, file = "MAY.merge.obj.final.obj.final.obj")
+```
+
+
+
+
+
+
+```{r}
+load("poster.MG.obj.Rdata") # MG.obj
+
+```
+
+
+
+
+
+
+```{r}
+FeaturePlot(MG.obj, features = c("P2ry12"))
+FeaturePlot(MG.obj, features = c("Snap25"))
+FeaturePlot(MG.obj, features = c("Mrc1"))
+DimPlot(MG.obj,group.by = "State")
+DimPlot(MG.obj,group.by = "orig.ident")
+```
+
+
+```{r}
+table(MG.obj$orig.ident,MG.obj$State)
+```
+
+```{r}
+MG.obj.snap25.df <- FetchData(MG.obj, vars = "Snap25")
+
+table(MG.obj.snap25.df$rna_Snap25 > 1)
+
+range(MG.obj)
+```
+```{r}
+DefaultAssay(MG.obj) <- "RNA"
+MG.filtered.obj <- subset(
+  MG.obj,
+  subset = Snap25 <= 1
+)
+```
+
+```{r}
+DefaultAssay(MG.filtered.obj) <- "pathway_bench"
+DimPlot(MG.filtered.obj,group.by = "State",label = T)
+```
+
+
+```{r}
+table(MG.filtered.obj$orig.ident,MG.filtered.obj$State)
+```
+
+```{r}
+DefaultAssay(MG.recluster.obj) <- "pathway_bench"
+MG.recluster.obj <- MG.filtered.obj
+
+MG.recluster.obj <- FindNeighbors(MG.recluster.obj,graph.name = "bench_nmf_snn")
+MG.recluster.obj <- FindClusters(MG.recluster.obj,graph.name = "bench_nmf_snn",resolution = 0.3)
+
+MG.recluster.obj <- RunUMAP(MG.recluster.obj,reduction = "nmf",dims = 1:20,reduction.name = "nmf_umap",reduction.key = "NMFUMAP_")
+
+DimPlot(MG.recluster.obj,label = T)
+```
+
+
+```{r}
+DimPlot(MG.recluster.obj,group.by = "State")
+DimPlot(MG.recluster.obj,group.by = "orig.ident")
+DimPlot(MG.recluster.obj,group.by = "seurat_clusters",label = T)
+DimPlot(MG.recluster.obj,group.by = "time_condition")
+```
+
+
+```{r}
+state_anno <- c(
+  "0"  = "State5",
+  "1"  = "State1",
+  "2"  = "State2",
+  "3"  = "State3",
+  "4"  = "State4"
+)
+
+MG.recluster.obj$state_anno <- unname(state_anno[as.character(MG.recluster.obj$seurat_clusters)])
+```
+
+```{r}
+DimPlot(MG.recluster.obj,group.by = "state_anno")
+```
+
+
+```{r}
+save(MG.recluster.obj,file = "MAY.MG.recluster.obj.Rdata")
+```
+
+
+```{r}
+# Current object
+merge.obj.final.obj <- merge_obj_filtered
+
+# All cells in merge object
+all.cells <- colnames(merge.obj.final.obj)
+
+# Microglia cells in merge object
+mg.cells.in.merge <- colnames(merge.obj.final.obj)[
+  merge.obj.final.obj$annotation3 == "Microglia"
+]
+
+# Microglia cells that are also present in MG.recluster.obj
+mg.cells.keep <- intersect(
+  mg.cells.in.merge,
+  colnames(MG.recluster.obj)
+)
+
+# Non-microglia cells should all be kept
+non.mg.cells.keep <- colnames(merge.obj.final.obj)[
+  merge.obj.final.obj$annotation3 != "Microglia"
+]
+
+# Final cells to keep
+keep.cells <- c(non.mg.cells.keep, mg.cells.keep)
+
+# Subset object
+merge.obj.final.obj <- subset(
+  merge.obj.final.obj,
+  cells = keep.cells
+)
+
+# Check result
+table(merge.obj.final.obj$annotation3)
+
+# Save
+save(
+  merge.obj.final.obj,
+  file = "MAY.merge.obj.final.obj.final.obj.Rdata"
+)
+```
+```{r}
+DimPlot(merge.obj.final.obj,reduction = "umap",
+        group.by  = "annotation3",
+        label     = T)
+```
+
+

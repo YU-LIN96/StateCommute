@@ -1,0 +1,685 @@
+---
+title: "Untitled"
+author: "Yu"
+date: "2026-05-20"
+output: html_document
+---
+
+
+```{r}
+load("MAY.MG.recluster.obj.Rdata")
+```
+
+
+```{r}
+emb <- Embeddings(MG.recluster.obj, "nmf_umap")
+x <- emb[, 1]
+y <- emb[, 2]
+
+xmin <- min(x)
+xmax <- max(x)
+ymin <- min(y)
+ymax <- max(y)
+
+xrange <- xmax - xmin
+yrange <- ymax - ymin
+
+# 左下角短轴
+axis_df <- data.frame(
+  x = c(xmin, xmin, xmin, xmin + 0.12 * xrange),
+  y = c(ymin, ymin + 0.12 * yrange, ymin, ymin),
+  group = c(1, 1, 2, 2)
+)
+
+# 轴标签
+label_df <- data.frame(
+  x = c(xmin - 0.06 * xrange, xmin + 0.10 * xrange),
+  y = c(ymin + 0.08 * yrange, ymin - 0.06 * yrange),
+  label = c("UMAP2", "UMAP1"),
+  angle = c(90, 0)
+)
+
+axes_conner <- function(p){ 
+  p + 
+    labs(x = NULL, y = NULL) +
+    xlab(NULL) +
+    ylab(NULL) +
+    theme_classic(base_size = 18) +
+    theme(
+      axis.title = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_blank()
+    ) +
+    geom_line(
+      data = axis_df,
+      aes(x = x, y = y, group = group),
+      inherit.aes = FALSE,
+      linewidth = 0.6,
+      color = "black",
+      arrow = arrow(length = unit(0.12, "in"), ends = "last", type = "open")
+    ) +
+    geom_text(
+      data = label_df,
+      aes(x = x, y = y, label = label, angle = angle),
+      inherit.aes = FALSE,
+      size = 2,
+      color = "black"
+    )
+}
+```
+
+
+TimePoint
+# Control #B1A9E5
+# Diesease #6A5ACD
+
+condition
+# VEEV #CD5C5C
+# TBI #5B94CD
+# OPNA #5BCD94
+
+dataset
+# Acute #0072B2
+# Chronic #E69F00
+
+```{r}
+p_state_dim <- DimPlot(MG.recluster.obj, group.by = "state_anno",reduction = "nmf_umap",label = F)
+
+p_timepont_dim <- DimPlot(MG.recluster.obj, group.by = "TimePoint", reduction = "nmf_umap",pt.size = 0.0001)
+p_condition_dim <- DimPlot(MG.recluster.obj, group.by = "condition", reduction = "nmf_umap",pt.size = 0.0001)
+p_dataset_dim <- DimPlot(MG.recluster.obj, group.by = "dataset", reduction = "nmf_umap",pt.size = 0.0001)
+
+```
+
+
+```{r}
+# 先定义各分组对应的颜色(用命名向量)
+timepoint_cols <- c(
+  "Acute"   = "#0072B2",
+  "Chronic" = "#E69F00"
+)
+
+condition_cols <- c(
+  "Control" = "#B1A9E5",
+  "Disease" = "#6A5ACD"
+)
+
+dataset_cols <- c(
+  "VEEV" = "#CD5C5C",
+  "TBI"  = "#5B94CD",
+  "OPNA" = "#5BCD94"
+)
+
+# state_anno 没给颜色,保持默认
+p_state_dim <- DimPlot(MG.recluster.obj, group.by = "state_anno",
+                       reduction = "nmf_umap", label = F)
+
+p_timepont_dim <- DimPlot(MG.recluster.obj, group.by = "TimePoint",
+                          reduction = "nmf_umap", pt.size = 0.0001,
+                          cols = timepoint_cols)
+
+p_condition_dim <- DimPlot(MG.recluster.obj, group.by = "condition",
+                           reduction = "nmf_umap", pt.size = 0.0001,
+                           cols = condition_cols)
+
+p_dataset_dim <- DimPlot(MG.recluster.obj, group.by = "dataset",
+                         reduction = "nmf_umap", pt.size = 0.0001,
+                         cols = dataset_cols)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# 从 plot 中提取颜色映射
+state_colors <- ggplot_build(p_state_dim)$plot$scales$scales[[3]]$palette.cache
+
+# 给颜色命名
+state_levels <- levels(factor(MG.recluster.obj$state_anno))
+names(state_colors) <- state_levels
+
+```
+
+
+
+```{r}
+p_state_axe <- axes_conner(p_state_dim)
+
+p_timepont_axe <- axes_conner(p_timepont_dim)
+p_condition_axe <- axes_conner(p_condition_dim)
+p_dataset_axe <- axes_conner(p_dataset_dim)
+
+
+
+panel_combined_for_MG <- 
+  (p_state_axe | (p_timepont_axe / p_condition_axe / p_dataset_axe)) +
+      plot_layout(widths = c(3, 1))
+
+pdf("./Figure_Final/Combined_Dimplot.pdf",
+  width = 15,height = 8)
+panel_combined_for_MG
+dev.off()
+```
+
+
+
+
+```{r}
+MG.recluster.obj$state_anno <- factor(MG.recluster.obj$state_anno, 
+                                      levels = c("State1","State2","State3","State4","State5"))
+```
+
+
+```{r}
+MG.recluster.obj$state_anno_compare <- as.character(MG.recluster.obj$state_anno)
+MG.recluster.obj$state_anno_compare[MG.recluster.obj$state_anno_compare %in% c("State1","State2")] <- "Control"
+
+MG.recluster.obj$state_anno_compare <- factor(MG.recluster.obj$state_anno_compare,
+                                              levels = c("Control","State3","State4","State5"))
+```
+
+
+
+```{r}
+Idents(MG.recluster.obj) <- "state_anno_compare"
+state.pathway.markers <- FindAllMarkers(MG.recluster.obj,only.pos = T)
+state.pathway.markers$pct.diff <- state.pathway.markers$pct.1 - state.pathway.markers$pct.2
+state.pathway.markers.sig <- state.pathway.markers[state.pathway.markers$p_val_adj < 0.05,]
+state.pathway.markers.sig.pct <- state.pathway.markers.sig[state.pathway.markers.sig$pct.diff > 0.3,]
+```
+
+
+```{r}
+top_pathways <- state.pathway.markers.sig.pct %>%
+  group_by(cluster) %>%
+  arrange(desc(pct.diff), .by_group = TRUE) %>%
+  group_modify(~ {
+    n_keep <- ifelse(unique(.y$cluster) == "Control", 6, 3)
+    slice_head(.x, n = n_keep)
+  }) %>%
+  ungroup()
+
+
+feature_color_df <- top_pathways %>%
+  dplyr::select(gene, cluster) %>%
+  dplyr::distinct()
+
+top_features.filt <- feature_color_df$gene
+
+vlnt.marker.color <- state_colors[as.character(feature_color_df$cluster)]
+vlnt.marker.color.unfilt[is.na(vlnt.marker.color.unfilt)] <- "#F8766D"
+names(vlnt.marker.color) <- feature_color_df$gene
+
+pdf("./Figure_Final/Vlnplot_filter_feature.pdf",
+    width = 14, height = 8)
+
+VlnPlot(
+  MG.recluster.obj,
+  group.by  = "state_anno",
+  features  = top_features.filt,
+  stack     = TRUE,
+  flip      = TRUE,
+  fill.by   = "feature",
+  cols      = vlnt.marker.color,
+) &
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.y.right = element_text(
+      hjust = 0,
+      face  = "bold",
+      size  = 14
+    )
+  )
+
+dev.off()
+```
+
+
+
+```{r}
+# Plot cell fraction
+dat_frac <- as.data.frame(table(MG.recluster.obj$time_condition, MG.recluster.obj$state_anno))
+count <- tapply(dat_frac$Freq, dat_frac$Var2, sum)
+dat_frac$fraction <- dat_frac$Freq / rep(count, each = 4)
+dat_frac$Var1 <- factor(dat_frac$Var1, levels = c("Acute Control", "Acute Disease", 
+                                                  "Chronic Control", "Chronic Disease"))
+dat_frac$Var2 <- factor(dat_frac$Var2, levels = levels(MG.recluster.obj$state_anno))
+
+p2 <- ggplot(dat_frac, aes(x = Var2, y = fraction, fill = Var1)) +
+  geom_bar(stat = "identity") +
+  xlab("") + ylab("Fraction of cells") +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 13, angle = 45, vjust = 1, hjust = 1, color = "black"),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(expand = c(0, 0)) #+
+  # scale_fill_manual(name = "", values = group_colors)
+
+pdf("p2.pdf", width = 6, height = 5)
+
+print(p2)
+
+dev.off()
+
+```
+
+
+
+```{r}
+library(ggpattern)
+
+# 背景色:按 dataset 区分(Acute / Chronic)
+fill_cols <- c(
+  "Acute Control"   = "#0072B2",
+  "Acute Disease"   = "#0072B2",
+  "Chronic Control" = "#E69F00",
+  "Chronic Disease" = "#E69F00"
+)
+# 斜纹色:按 condition 区分(Control / Disease)
+pattern_fill_cols <- c(
+  "Acute Control"   = "#B1A9E5",
+  "Acute Disease"   = "#6A5ACD",
+  "Chronic Control" = "#B1A9E5",
+  "Chronic Disease" = "#6A5ACD"
+)
+
+p3 <- ggplot(dat_frac, aes(x = Var2, y = fraction,
+                           fill = Var1, pattern_fill = Var1)) +
+  geom_col_pattern(
+    pattern         = "stripe",
+    pattern_angle   = 45,     # 斜纹角度
+    pattern_density = 0.5,    # 0.5 = 两色各占一半,交错最均匀
+    pattern_spacing = 0.02,   # 条纹间距,越小条纹越密
+    pattern_colour  = NA,     # 去掉条纹边线
+    colour          = NA      # 去掉柱子边线
+  ) +
+  scale_fill_manual(name = "Var1", values = fill_cols) +
+  scale_pattern_fill_manual(name = "Var1", values = pattern_fill_cols) +
+  xlab("") + ylab("Fraction of cells") +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 13, angle = 45, vjust = 1, hjust = 1, color = "black"),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.title = element_text(size = 13, color = "black"),
+    axis.line = element_line()
+  ) +
+  scale_y_continuous(expand = c(0, 0))
+```
+
+
+
+```{r}
+Idents(MG.recluster.obj) <- "state_anno"
+state.each.pathway.markers <- FindAllMarkers(MG.recluster.obj,only.pos = T)
+state.each.pathway.markers$pct.diff <- state.each.pathway.markers$pct.1 - state.each.pathway.markers$pct.2
+state.each.pathway.markers.sig <- state.each.pathway.markers[state.each.pathway.markers$p_val_adj < 0.05,]
+
+state.each.pathway.markers.sig.fld <- state.each.pathway.markers.sig[state.each.pathway.markers.sig$avg_log2FC > log2(1.5) &
+                                                             state.each.pathway.markers.sig$pct.diff > 0.3,]
+```
+
+
+```{r INPUT VALIDATION & STANDARDISATION}
+source("standardize_genesets.R")
+source("build_geneset_sparse_matrix.R")
+source("compute_similarity.R")
+source("redudancy_grouping.R")
+source("representative_term_selection.R")
+source("main_wrapper.R")
+
+source("Reduction_Visualization_for_Figure_demo.R")
+
+source("build_reduced_terms_simple.R")
+```
+
+```{r}
+library(msigdbr)
+```
+
+
+
+```{r total gene sets}
+## =========================================================
+## Mouse-native MSigDB gene sets (db_species = "MM")
+##   - MH  : mouse Hallmark (mouse-native)
+##   - M5  : mouse GO (we'll take GO:BP and filter size)
+##   - M7  : mouse Immunologic signatures
+## Optional:
+##   - M8  : mouse cell-type signatures (identity; usually NOT for "state")
+## Notes:
+##   * Reactome / KEGG / WikiPathways are NOT mouse-native in MSigDB.
+##     Those live under human C2 and require ortholog mapping.
+## =========================================================
+
+## -------------------------
+## Tier 1 (mouse-native)
+##   - MH (Hallmark)
+## -------------------------
+m_mh <- msigdbr(category   = "MH", species  = "mouse", db_species = "MM")
+genesets_MH <- split(m_mh$gene_symbol, m_mh$gs_name)
+
+
+# 2) Reactome pathways
+m_mreactome <- msigdbr(species = "mouse", category = "M2", subcategory = "CP:REACTOME", db_species = "MM")
+genesets_M2_REACTOME <- split(m_mreactome$gene_symbol, m_mreactome$gs_name)
+
+# 3) WikiPath pathways
+m_mwiki <- msigdbr(species = "mouse", category = "M2", subcategory = "CP:WIKIPATHWAYS", db_species = "MM")
+genesets_M2_WIKI <- split(m_mwiki$gene_symbol, m_mwiki$gs_name)
+
+
+genesets_tier1_mouse <- c(genesets_MH,genesets_M2_REACTOME,genesets_M2_WIKI)
+
+## -------------------------
+## Tier 2 (mouse-native)
+##   - M7 (Immunologic)
+##   - M5:GO:BP (filtered by size)
+## -------------------------
+
+# M7: Immunologic signatures (FULL)
+m_m7 <- msigdbr(species = "mouse",category   = "M7", db_species = "MM")
+genesets_M7_all <- split(m_m7$gene_symbol, m_m7$gs_name)
+
+# M5: GO Biological Process (GO:BP), then size-filter
+m_m5_gobp <- msigdbr(species = "mouse",category = "M5", subcollection = "GO:BP", db_species = "MM")
+
+m_m5_gobp_filt <- m_m5_gobp %>%
+  group_by(gs_name) %>%
+  filter(dplyr::n() >= 20 & dplyr::n() <= 200) %>%
+  ungroup()
+
+genesets_M5_GO_BP_filtered <- split(m_m5_gobp_filt$gene_symbol, m_m5_gobp_filt$gs_name)
+
+genesets_tier2_mouse <- c(genesets_M7_all, genesets_M5_GO_BP_filtered)
+
+
+## -------------------------
+## Final (mouse-native)
+## -------------------------
+genesets_mouse_final <- c(genesets_tier1_mouse, genesets_tier2_mouse)
+
+```
+
+```{r}
+# =============================================================================
+# STEP 1: Extract AUCell matrix and align gene sets
+# =============================================================================
+ 
+# Pull pathway x cell matrix from the AUCell assay
+auc_mat <- tryCatch(
+  GetAssayData(MG.recluster.obj, assay = "AUCell", layer = "data"),   # Seurat v5
+  error = function(e)
+    GetAssayData(MG.recluster.obj, assay = "AUCell", slot  = "data")  # Seurat v4
+)
+
+auc_pathways <- rownames(auc_mat)
+
+# --- Harmonise naming: replace "_" with "-" in genesets names ---
+# AUCell uses "-" as separator; msigdbr uses "_"
+names(genesets_mouse_final) <- gsub("_", "-", names(genesets_mouse_final))
+
+# Keep only gene sets present in both
+common_terms <- intersect(auc_pathways, names(genesets_mouse_final))
+
+cat(sprintf("AUCell pathways        : %d\n", length(auc_pathways)))
+cat(sprintf("genesets_mouse_final   : %d\n", length(genesets_mouse_final)))
+cat(sprintf("Matched common terms   : %d\n", length(common_terms)))
+
+n_missing <- length(auc_pathways) - length(common_terms)
+if (n_missing > 0)
+  warning(sprintf(
+    "%d AUCell pathways still unmatched after name harmonisation.",
+    n_missing))
+
+# Subset both objects to matched terms only
+genesets_auc <- genesets_mouse_final[common_terms]
+auc_mat      <- auc_mat[common_terms, ]
+```
+
+
+
+
+```{r}
+genesets_std <- standardize_genesets(genesets_auc, min_geneset_size = 5)
+M_sparse     <- build_geneset_sparse_matrix(genesets_std)
+sim_mat_MG   <- compute_similarity(M_sparse, method = "overlap")
+```
+
+
+
+
+```{r}
+for (stte in c("State1","State2","State3","State4","State5")) {
+  assign(paste("reduced_by",stte, sep = "_"),
+         build_reduced_terms_simple(
+            terms = state.each.pathway.markers.sig.fld[state.each.pathway.markers.sig.fld$cluster == stte,]$gene,
+            sim_mat = sim_mat_MG,
+            genesets = genesets_auc,
+            threshold = 0.3,
+            method = "graph",
+            community_detection = "components",
+            rep_rule = "central_term"
+          )
+)
+}
+
+
+for (stte in c("State1","State2","State3","State4","State5")) {
+  df <- get(paste("reduced_by",stte, sep = "_"))
+  df <- df[c("term","parentTerm","group","size","score")]
+  df$cluster <- stte
+    assign(paste("mod_reduced_by",stte, sep = "_"), df)
+}
+
+
+parent_terms_df <- bind_rows(
+  data.frame(gene = unique(reduced_by_State1$parentTerm), cluster = "State1"),
+  data.frame(gene = unique(reduced_by_State2$parentTerm), cluster = "State2"),
+  data.frame(gene = unique(reduced_by_State3$parentTerm), cluster = "State3"),
+  data.frame(gene = unique(reduced_by_State4$parentTerm), cluster = "State4"),
+  data.frame(gene = unique(reduced_by_State5$parentTerm), cluster = "State5")
+)
+
+parent_terms_df <- bind_rows(mod_reduced_by_State1,
+                             mod_reduced_by_State2,
+                             mod_reduced_by_State3,
+                             mod_reduced_by_State4,
+                             mod_reduced_by_State5)
+```
+
+
+```{r reduced term heatmap}
+library(ComplexHeatmap)
+library(circlize)
+```
+
+
+
+
+```{r}
+selected_pathways <- unique(parent_terms_df$parentTerm)
+matrix_data <- as.matrix(MG.recluster.obj[["AUCell"]]$data[selected_pathways, ])
+
+# correlation
+cor_matrix <- cor(t(matrix_data))
+
+# 准备注释和颜色
+regime_info <- parent_terms_df
+regime_colors <- state_colors
+
+
+
+# 关键：把 -0.5 到 0.5 压成白色区域
+# col_fun <- colorRamp2(
+#   c(-1, -0.3, 0, 0.3, 1),
+#   c("blue", "white", "grey","white", "red")
+# )
+
+col_fun <- colorRamp2(
+  c(-1, -0.5, 0, 0.5, 1),
+  c("blue", "white", "white","white", "red")
+)
+
+# col_fun <- colorRamp2(
+#   c(-1, 0, 1),
+#   c("blue", "white", "red")
+# )
+
+# 绘制热图
+h_reduced <- Heatmap(cor_matrix, 
+        name = "Correlation",
+        col = col_fun,
+        column_split = regime_info$cluster, 
+        row_split = regime_info$cluster,
+        cluster_row_slices = FALSE, 
+        cluster_column_slices = FALSE,
+        top_annotation = HeatmapAnnotation(State = regime_info$cluster, col = list(State = regime_colors)),
+        left_annotation = rowAnnotation(State = regime_info$cluster, col = list(State = regime_colors)),
+        column_title = "Reduced AUCell Functional Modules",
+        show_row_names = FALSE, 
+        show_column_names = FALSE,
+        use_raster = TRUE)
+
+# pdf(
+#   # "./Figure/cor0.3_reduced_marker_htmp.pdf",
+#   "./Figure_Final/cor0.5_reduced_marker_htmp.pdf",
+#   # "./Figure_Final/cor0_reduced_marker_htmp.pdf",
+#   width = 10,height = 8)
+# 
+# draw(h_reduced)
+# dev.off()
+```
+
+```{r}
+library(dplyr)
+
+states <- c("State1", "State2", "State3", "State4", "State5")
+
+# 每个 State 只保留约简后的代表(parent) term —— 每个冗余组一行
+parent_terms_df <- bind_rows(lapply(states, function(stte) {
+  get(paste("reduced_by", stte, sep = "_")) %>%
+    filter(term == parentTerm) %>%        # 代表行：term 等于自己的 parentTerm
+    distinct(term, .keep_all = TRUE) %>%  # 防御性去重（组内不应有重复）
+    transmute(term, parentTerm, group, size, score, cluster = stte)
+}))
+
+write.csv(parent_terms_df, file = "MAY.parent_terms_df.MG.csv")
+```
+
+
+```{r}
+# 1) 确保代表通路都在 AUCell 矩阵里（避免按行名取子集时报错/产生 NA 行）
+available <- rownames(MG.recluster.obj[["AUCell"]]$data)
+missing   <- setdiff(unique(parent_terms_df$term), available)
+if (length(missing) > 0) {
+  warning(sprintf("%d 条通路不在 AUCell data 中，已剔除：%s",
+                  length(missing), paste(head(missing, 5), collapse = ", ")))
+  parent_terms_df <- parent_terms_df[parent_terms_df$term %in% available, ]
+}
+
+selected_pathways <- parent_terms_df$term
+matrix_data <- as.matrix(MG.recluster.obj[["AUCell"]]$data[selected_pathways, , drop = FALSE])
+
+# 2) 通路 × 通路 的相关性（在细胞维度上）
+cor_matrix <- cor(t(matrix_data))
+
+# 3) 注释与配色，按行与 parent_terms_df 一一对应
+regime_info   <- parent_terms_df
+regime_colors <- state_colors
+
+col_fun <- colorRamp2(
+  c(-1, -0.5, 0, 0.5, 1),
+  c("blue", "white", "white", "white", "red")
+)
+
+h_reduced <- Heatmap(
+  cor_matrix,
+  name                  = "Correlation",
+  col                   = col_fun,
+  column_split          = regime_info$cluster,
+  row_split             = regime_info$cluster,
+  cluster_row_slices    = FALSE,
+  cluster_column_slices = FALSE,
+  top_annotation  = HeatmapAnnotation(State = regime_info$cluster,
+                                      col = list(State = regime_colors)),
+  left_annotation = rowAnnotation(State = regime_info$cluster,
+                                  col = list(State = regime_colors)),
+  column_title      = "Reduced AUCell Functional Modules",
+  show_row_names    = FALSE,
+  show_column_names = FALSE,
+  use_raster        = TRUE
+)
+
+pdf("./Figure_Final/cor0.5_reduced_marker_htmp.pdf", width = 10, height = 8)
+draw(h_reduced)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(SCP)
+```
+
+
+```{r}
+
+
+ht <- SCP::GroupHeatmap(
+  MG.recluster.obj,
+  slot = "data",
+  assay = "pathway_bench",
+  features = top_features.filt,
+  group.by = "state_anno",
+  group_palette = "Paired",
+  group_palcolor = list(state_colors),
+  show_row_names = TRUE,
+  row_names_side = "left",
+  nlabel = 0,
+  add_dot = TRUE,
+  add_reticle = TRUE
+)
+
+
+# 3. 渲染出图
+
+p <- ht$plot +
+  theme(
+    plot.margin = margin(10, 10, 10, 220, unit = "pt"),
+    axis.text.y = element_text(
+      size = 8,
+      hjust = 1
+    )
+  )
+
+pdf("./Figure_Final/Dotplot.pdf", width = 10, height = 8)
+print(p)
+dev.off()
+```
