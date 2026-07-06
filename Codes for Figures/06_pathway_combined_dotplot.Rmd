@@ -1,0 +1,370 @@
+---
+title: ''
+author: "Rohit"
+date: "2026-06-29"
+output: html_document
+---
+
+```{r}
+# =============================================================================
+# Combined Pathway Dotplot: FN1 / CCL / ApoE (Microglia, Acute Timepoints)
+# -----------------------------------------------------------------------------
+# Description:
+#   For each activated microglia state (State3/FN1, State4/CCL, State5/ApoE),
+#   computes disease-vs-homeostatic differential expression at the acute
+#   timepoint, then builds a per-pathway dotplot (gene x state) encoding:
+#     - point color   : average log2 fold-change vs. homeostatic microglia
+#     - point size     : percent of cells expressing the gene
+#     - point outline  : DEG status (|log2FC| > log2(1.2) and p_val <= 0.05)
+#   The three pathway dotplots are combined side-by-side into a single figure
+#   with a shared color/size legend and a common fold-change color scale.
+#
+# Inputs:
+#   - MAY.merge.obj.final.obj.final.obj.Rdata  (merged Seurat object)
+#   - MAY.MG.recluster.obj.Rdata                (microglia-only Seurat object)
+#   - FN1.genes, CCL.genes, ApoE.genes          (newline-delimited gene lists)
+#
+# Outputs:
+#   - MG_pathway_combined_dotplot.pdf   (combined 3-panel dotplot figure)
+#   - MG_pathway_calculate.Rdata        (per-state FindMarkers results)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(grid)
+  library(patchwork)
+})
+
+options(stringsAsFactors = FALSE)
+
+# =============================================================================
+# 1. Configuration
+# =============================================================================
+
+config <- list(
+  
+  # -- File paths ----------------------------------------------------------
+  merge_obj_path = "/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.merge.obj.final.obj.final.obj.Rdata",
+  mg_obj_path    = "/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.MG.recluster.obj.Rdata",
+  gene_list_paths  = c(FN1 = "genesets/FN1.genes",
+                       CCL = "genesets/CCL.genes",
+                       ApoE = "genesets/ApoE.genes"),
+  output_plot_path = "MG_pathway_combined_dotplot.pdf",
+  output_deg_path  = "MG_pathway_calculate.Rdata",
+  
+  # -- Data schema -----------------------------------------------------------
+  state_col     = "state_anno",     # microglia state metadata column
+  condition_col = "orig.ident",     # sample/condition metadata column
+  
+  # -- Sample -> stage / condition mapping ----------------------------------
+  acute_ids   = c("OPNA_GD_24h",  "OPNA_Control_24h",
+                  "TBI_CCI_7d",   "TBI_Sham_7d",
+                  "VEEV_VEEV_7d", "VEEV_Mock_7d"),
+  disease_ids = c("OPNA_GD_24h", "TBI_CCI_7d", "VEEV_VEEV_7d"),
+  
+  # -- Microglia states ------------------------------------------------------
+  homeostatic_states = c("State1", "State2"),
+  activated_states   = c("State3", "State4", "State5"),
+  state_pathway_map   = c(State3 = "FN1", State4 = "CCL", State5 = "ApoE"),
+  
+  # -- DEG test parameters ---------------------------------------------------
+  min_cells_per_group = 3,
+  min_pct              = 0.05,
+  deg_lfc_cut           = log(1.2, base = 2),
+  deg_pval_cut          = 0.05
+)
+
+# =============================================================================
+# 2. Helper functions
+# =============================================================================
+
+#' Load the merged and microglia-recluster Seurat objects, subset the merged
+#' object to microglia only, and annotate stage/condition metadata.
+#'
+#' @param cfg Configuration list (see `config`).
+#' @return A Seurat object containing microglia cells only, with `mg_state`,
+#'   `stage`, and `Condition_DEG` metadata columns added.
+load_and_prepare_microglia <- function(cfg) {
+  
+  merge_env <- new.env()
+  load(cfg$merge_obj_path, envir = merge_env)
+  mg_env <- new.env()
+  load(cfg$mg_obj_path, envir = mg_env)
+  
+  merged <- get(ls(merge_env)[1], envir = merge_env)
+  mg     <- get(ls(mg_env)[1], envir = mg_env)
+  
+  mg_state_labels <- setNames(mg[[cfg$state_col, drop = TRUE]], colnames(mg))
+  shared_cells    <- intersect(colnames(merged), names(mg_state_labels))
+  
+  merged$mg_state <- NA
+  merged$mg_state[shared_cells] <- mg_state_labels[shared_cells]
+  
+  mg_obj <- merged[, !is.na(merged$mg_state)]
+  message("Microglia cells: ", ncol(mg_obj))
+  
+  condition_vec <- mg_obj[[cfg$condition_col, drop = TRUE]]
+  mg_obj$stage         <- ifelse(condition_vec %in% cfg$acute_ids, "Acute", NA)
+  mg_obj$Condition_DEG <- ifelse(condition_vec %in% cfg$disease_ids,
+                                 "Disease", "Control")
+  
+  mg_obj
+}
+
+#' Run disease-vs-homeostatic differential expression for a single activated
+#' microglia state at the acute timepoint.
+#'
+#' @param state Name of the activated state (e.g. "State3").
+#' @param mg_obj Microglia Seurat object from `load_and_prepare_microglia()`.
+#' @param cfg Configuration list.
+#' @return A `FindMarkers` result data frame, or `NULL` if the comparison was
+#'   skipped (too few cells) or failed.
+run_state_deg <- function(state, mg_obj, cfg) {
+  
+  cells_activated <- colnames(mg_obj)[
+    mg_obj$mg_state == state &
+      !is.na(mg_obj$stage) &
+      mg_obj$Condition_DEG == "Disease"
+  ]
+  
+  cells_baseline <- colnames(mg_obj)[
+    mg_obj$mg_state %in% cfg$homeostatic_states &
+      !is.na(mg_obj$stage) &
+      mg_obj$Condition_DEG == "Control"
+  ]
+  
+  n_activated <- length(cells_activated)
+  n_baseline  <- length(cells_baseline)
+  
+  if (n_activated < cfg$min_cells_per_group || n_baseline < cfg$min_cells_per_group) {
+    message(sprintf("Skipping %s (Activated=%d, Baseline=%d)",
+                    state, n_activated, n_baseline))
+    return(NULL)
+  }
+  
+  message(sprintf("FindMarkers: %s (Activated=%d, Baseline=%d)",
+                  state, n_activated, n_baseline))
+  
+  temp <- mg_obj[, c(cells_activated, cells_baseline)]
+  temp$DEG_group <- ifelse(colnames(temp) %in% cells_activated,
+                           "Activated", "Baseline")
+  
+  result <- tryCatch(
+    FindMarkers(temp,
+                ident.1  = "Activated",
+                ident.2  = "Baseline",
+                group.by = "DEG_group",
+                min.pct  = cfg$min_pct),
+    error = function(e) {
+      message("  ERROR: ", conditionMessage(e))
+      NULL
+    }
+  )
+  
+  if (is.null(result) || nrow(result) == 0) {
+    message("  No results for ", state)
+    return(NULL)
+  }
+  
+  message("  Background=", nrow(result))
+  result
+}
+
+#' Run `run_state_deg()` across all activated states.
+#'
+#' @param mg_obj Microglia Seurat object.
+#' @param cfg Configuration list.
+#' @return A named list of `FindMarkers` result data frames, keyed by state.
+compute_all_state_degs <- function(mg_obj, cfg) {
+  degs <- lapply(cfg$activated_states, run_state_deg, mg_obj = mg_obj, cfg = cfg)
+  names(degs) <- cfg$activated_states
+  Filter(Negate(is.null), degs)
+}
+
+#' Read a newline-delimited gene list from disk.
+#'
+#' @param path Path to a single-column, no-header gene list file.
+#' @return A character vector of gene symbols.
+read_gene_list <- function(path) {
+  read.table(path, header = FALSE, stringsAsFactors = FALSE)[, 1]
+}
+
+#' Build a tidy per-gene, per-state data frame for one pathway, restricted to
+#' its gene set and annotated for plotting.
+#'
+#' @param genes Character vector of pathway gene symbols.
+#' @param pathway_label Display label for the pathway (e.g. "FN1").
+#' @param deg_results Named list of `FindMarkers` results from
+#'   `compute_all_state_degs()`.
+#' @param cfg Configuration list.
+#' @return A data frame ready for `make_dotplot_panel()`, or `NULL` if no
+#'   genes matched any state's DEG results.
+build_pathway_df <- function(genes, pathway_label, deg_results, cfg) {
+  
+  rows <- list()
+  
+  for (state in cfg$activated_states) {
+    result <- deg_results[[state]]
+    if (is.null(result) || nrow(result) == 0) next
+    
+    matched <- result[rownames(result) %in% genes, , drop = FALSE]
+    if (nrow(matched) == 0) next
+    
+    matched$mg_state     <- state
+    matched$gene         <- rownames(matched)
+    matched$gene_pathway <- pathway_label
+    rows[[state]] <- matched
+  }
+  
+  if (length(rows) == 0) return(NULL)
+  
+  df <- do.call(rbind, rows)
+  df$pct.1 <- df$pct.1 * 100
+  df$index <- factor(df$mg_state, levels = cfg$activated_states)
+  df$gene  <- factor(df$gene, levels = rev(genes))
+  df
+}
+
+#' Shared ggplot theme applied to every dotplot panel.
+base_theme <- theme(
+  panel.background = element_blank(),
+  panel.border     = element_rect(fill = NA, color = "grey70"),
+  axis.text.x      = element_text(color = "black", size = 12, angle = 40,
+                                  hjust = 1, vjust = 1),
+  axis.text.y      = element_text(color = "black", size = 12, face = "italic"),
+  axis.title       = element_blank(),
+  plot.margin      = margin(t = 5, r = 2, b = 5, l = 2),
+  legend.title     = element_text(size = 12),
+  legend.text      = element_text(size = 12)
+)
+
+#' Build a single pathway dotplot panel (gene x state), with DEGs
+#' highlighted by an open-square outline.
+#'
+#' @param df Data frame from `build_pathway_df()`.
+#' @param cfg Configuration list.
+#' @param fc_limit Symmetric color-scale limit for `avg_log2FC`, shared across
+#'   all panels so colors are comparable between pathways.
+#' @param show_y Whether to draw y-axis (gene) labels.
+#' @param show_legend Whether to draw the panel's own legend (typically only
+#'   `TRUE` for the last panel, with legends collected via patchwork).
+#' @return A ggplot object.
+make_dotplot_panel <- function(df, cfg, fc_limit, show_y = TRUE,
+                               show_legend = FALSE) {
+  
+  pathway_label <- unique(df$gene_pathway)
+  
+  df$deg_label <- ifelse(
+    abs(df$avg_log2FC) > cfg$deg_lfc_cut & df$p_val <= cfg$deg_pval_cut,
+    "DEG", "Non-DEG"
+  )
+  
+  p <- ggplot(df, aes(x = index, y = gene)) +
+    
+    geom_point(
+      data = df %>% filter(deg_label == "DEG"),
+      aes(size = pct.1 * 1.3),
+      shape = 22, color = "grey40", fill = NA, stroke = 1.2,
+      show.legend = FALSE
+    ) +
+    
+    geom_point(aes(color = avg_log2FC, size = pct.1, shape = deg_label)) +
+    
+    ggtitle(pathway_label) +
+    
+    scale_shape_manual(
+      name   = "DEG",
+      values = c("DEG" = 16, "Non-DEG" = 16)
+    ) +
+    scale_color_gradient2(
+      name     = "log2(Expression foldchange\nto homeostatic)",
+      low      = "darkblue", mid = "white", high = "#B2182B", midpoint = 0,
+      limits   = c(-fc_limit, fc_limit)   # shared scale across all panels
+    ) +
+    scale_size_continuous(
+      name   = "Percent of cells\nexpressed (%)",
+      range  = c(0.5, 6), breaks = c(10, 25, 50, 75, 100), limits = c(0, 100)
+    ) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_discrete(drop = TRUE) +
+    
+    guides(
+      shape = guide_legend(
+        title = "DEG",
+        override.aes = list(
+          shape = c(16, 16), color = c("black", "black"),
+          fill  = c("black", "black"), size = c(4, 4)
+        )
+      ),
+      size = guide_legend(
+        title = "Percent of cells\nexpressed (%)",
+        override.aes = list(shape = 16, color = "black", fill = "black")
+      ),
+      color = guide_colorbar(title = "log2 (Expression\nfoldchange to\nhomeostatic)")
+    ) +
+    
+    base_theme +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5,
+                                margin = margin(b = 6))
+    )
+  
+  if (!show_y)      p <- p + theme(axis.text.y  = element_blank(),
+                                   axis.ticks.y = element_blank())
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  
+  p
+}
+
+# =============================================================================
+# 3. Main
+# =============================================================================
+
+main <- function(cfg) {
+  
+  mg_obj <- load_and_prepare_microglia(cfg)
+  
+  deg_results <- compute_all_state_degs(mg_obj, cfg)
+  save(deg_results, file = cfg$output_deg_path)
+  message("Saved: ", cfg$output_deg_path)
+  
+  gene_lists <- lapply(cfg$gene_list_paths, read_gene_list)
+  
+  pathway_dfs <- Map(build_pathway_df,
+                     genes         = gene_lists,
+                     pathway_label = names(gene_lists),
+                     MoreArgs      = list(deg_results = deg_results, cfg = cfg))
+  
+  pathway_dfs <- Filter(Negate(is.null), pathway_dfs)
+  if (length(pathway_dfs) == 0) {
+    stop("No pathway genes matched any state's DEG results -- nothing to plot.")
+  }
+  
+  fc_limit <- max(abs(unlist(lapply(pathway_dfs, `[[`, "avg_log2FC"))), na.rm = TRUE)
+  
+  pathway_names <- names(pathway_dfs)
+  panels <- lapply(seq_along(pathway_dfs), function(i) {
+    make_dotplot_panel(
+      pathway_dfs[[i]], cfg, fc_limit,
+      show_y      = TRUE,
+      show_legend = (i == length(pathway_dfs))   # legend on the last panel only
+    )
+  })
+  
+  combined <- wrap_plots(panels, nrow = 1, guides = "collect") &
+    theme(legend.position = "right")
+  
+  pdf(cfg$output_plot_path, width = 6.5, height = 7)
+  print(combined)
+  dev.off()
+  message("Saved: ", cfg$output_plot_path)
+  
+  invisible(list(deg_results = deg_results, combined_plot = combined))
+}
+
+if (sys.nframe() == 0) {
+  main(config)
+}
+```

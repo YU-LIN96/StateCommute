@@ -1,0 +1,375 @@
+---
+title: ''
+author: "Rohit"
+date: "2026-06-29"
+output: html_document
+---
+
+```{r}
+# =============================================================================
+# Pathway Validation: Cascade Violin Plots (FN1 / CCL / ApoE)
+# -----------------------------------------------------------------------------
+# Description:
+#   Generates a combined, multi-pathway violin-plot figure validating
+#   ligand-receptor signaling activity in microglia states. For each pathway
+#   (FN1, CCL, ApoE), mean per-cell expression of the ligand and receptor
+#   gene sets is compared across three groups:
+#     1. Homeostatic microglia      (States 1-2, pooled across conditions)
+#     2. Target disease state       (pathway-specific state, disease condition
+#                                     only)
+#     3. Other cell types           (all non-microglial populations, disease
+#                                     condition only)
+#
+#   Ligand and receptor panels are stacked per pathway (Ligands on top,
+#   Receptors below), and all three pathways are combined into a single
+#   vertically stacked PDF figure.
+#
+# Inputs:
+#   - MAY.merge.obj.final.obj.final.obj.Rdata  (merged Seurat object: all cell
+#     types, all conditions)
+#   - MAY.MG.recluster.obj.Rdata               (microglia-only Seurat object)
+#
+# Output:
+#   - figures/Validation_all_pathways_cascade_violin.pdf
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+})
+
+options(stringsAsFactors = FALSE)
+
+# =============================================================================
+# 1. Configuration
+# =============================================================================
+
+config <- list(
+  
+  # -- File paths --------------------------------------------------------
+  merge_obj_path = "/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.merge.obj.final.obj.final.obj.Rdata",
+  mg_obj_path    = "/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.MG.recluster.obj.Rdata",
+  output_dir     = "figures",
+  output_file    = "Validation_all_pathways_cascade_violin.pdf",
+  
+  # -- Data schema ---------------------------------------------------------
+  assay          = "RNA",
+  state_col      = "state_anno",     # microglia state metadata column
+  celltype_col   = "annotation3",    # cell-type metadata column (merged object)
+  condition_col  = "orig.ident",     # sample/condition metadata column
+  homeo_states   = c("State1", "State2"),
+  all_mg_states  = c("State1", "State2", "State3", "State4", "State5"),
+  
+  # -- Cell types to display in the "other cell types" panel section ------
+  celltype_order = c("Excitatory_Neurons", "Inhibitory_Neurons", "Astrocytes",
+                     "Endothelial_Cells", "OPCs", "Oligodendrocytes",
+                     "Pericytes", "Myeloid", "Lymphoid")
+)
+
+# -- Pathway definitions: colour, disease condition, target state, gene sets --
+pathway_defs <- list(
+  
+  FN1 = list(
+    color        = "#C75B4E",
+    target_state = "State3",
+    disease_id   = "OPNA_GD_24h",
+    control_id   = "OPNA_Control_24h",
+    disease_lab  = "OPNA",
+    ligands      = c("Fn1", "Thbs1", "Ibsp"),
+    receptors    = c("Itgav", "Itgb3", "Itga5", "Itgb1", "Cd44")
+  ),
+  
+  CCL = list(
+    color        = "#1D9E75",
+    target_state = "State4",
+    disease_id   = "VEEV_VEEV_7d",
+    control_id   = "VEEV_Mock_7d",
+    disease_lab  = "VEEV",
+    ligands      = c("Ccl2", "Ccl3", "Ccl4", "Ccl5"),
+    receptors    = c("Ccr1", "Ccr2", "Ccr5")
+  ),
+  
+  ApoE = list(
+    color        = "#534AB7",
+    target_state = "State5",
+    disease_id   = "TBI_CCI_7d",
+    control_id   = "TBI_Sham_7d",
+    disease_lab  = "TBI",
+    ligands      = c("Apoe", "Apoc1"),
+    receptors    = c("Trem2", "Lrp1", "Tyrobp")
+  )
+)
+
+# =============================================================================
+# 2. Helper functions
+# =============================================================================
+
+#' Load the merged and microglia-recluster Seurat objects and harmonize
+#' microglia state labels onto the merged object.
+#'
+#' @param cfg Named list of configuration parameters (see `config`).
+#' @return A list with `merged` (merged Seurat object, states transferred and
+#'   collapsed to "Microglia") and `mg` (microglia-only Seurat object).
+load_and_prepare_objects <- function(cfg) {
+  
+  merge_env <- new.env()
+  load(cfg$merge_obj_path, envir = merge_env)
+  mg_env <- new.env()
+  load(cfg$mg_obj_path, envir = mg_env)
+  
+  merged <- get(ls(merge_env)[1], envir = merge_env)
+  mg     <- get(ls(mg_env)[1], envir = mg_env)
+  
+  # Transfer microglia state labels onto the merged object
+  mg_state_labels <- setNames(mg[[cfg$state_col, drop = TRUE]], colnames(mg))
+  shared_cells    <- intersect(colnames(merged), names(mg_state_labels))
+  
+  collapsed_col <- paste0(cfg$celltype_col, "_collapsed")
+  merged[[cfg$celltype_col]][shared_cells, ] <- mg_state_labels[shared_cells]
+  merged[[collapsed_col]] <- merged[[cfg$celltype_col]]
+  
+  mg_mask <- merged[[collapsed_col, drop = TRUE]] %in% cfg$all_mg_states
+  merged[[collapsed_col]][mg_mask, ] <- "Microglia"
+  
+  DefaultAssay(merged) <- cfg$assay
+  DefaultAssay(mg)     <- cfg$assay
+  
+  list(merged = merged, mg = mg, collapsed_col = collapsed_col)
+}
+
+#' Identify the homeostatic, target-state, and other-cell-type cell subsets
+#' for a single pathway.
+#'
+#' @param def Pathway definition (element of `pathway_defs`).
+#' @param objs Output of `load_and_prepare_objects()`.
+#' @param cfg Configuration list.
+#' @return A list of cell barcodes per group, plus the ordered vector of
+#'   "other" cell-type names present in the data.
+build_cell_groups <- function(def, objs, cfg) {
+  
+  mg_states_vec <- objs$mg[[cfg$state_col, drop = TRUE]]
+  mg_cond_vec   <- objs$mg[[cfg$condition_col, drop = TRUE]]
+  
+  mg_cells_homeo  <- colnames(objs$mg)[mg_states_vec %in% cfg$homeo_states]
+  mg_cells_target <- colnames(objs$mg)[
+    mg_states_vec == def$target_state & mg_cond_vec == def$disease_id
+  ]
+  
+  merged_ct_vec   <- objs$merged[[objs$collapsed_col, drop = TRUE]]
+  merged_cond_vec <- objs$merged[[cfg$condition_col, drop = TRUE]]
+  
+  other_cells_list <- lapply(cfg$celltype_order, function(ct) {
+    cells <- colnames(objs$merged)[
+      merged_ct_vec == ct & merged_cond_vec == def$disease_id
+    ]
+    if (length(cells) == 0) return(NULL)
+    list(cells = cells, cell_type = ct)
+  })
+  other_cells_list <- Filter(Negate(is.null), other_cells_list)
+  
+  list(
+    mg_cells_homeo   = mg_cells_homeo,
+    mg_cells_target  = mg_cells_target,
+    other_cells_list = other_cells_list,
+    other_ct         = vapply(other_cells_list, `[[`, character(1), "cell_type")
+  )
+}
+
+#' Compute per-cell mean expression of a gene set for every group, returning a
+#' tidy data frame ready for plotting.
+#'
+#' @param genes Character vector of gene symbols.
+#' @param groups Output of `build_cell_groups()`.
+#' @param target_state Name of the pathway's target disease state.
+#' @param objs Output of `load_and_prepare_objects()`.
+#' @param cfg Configuration list.
+#' @return A data frame with columns `group` (factor) and `mean_exp`.
+build_expression_df <- function(genes, groups, target_state, objs, cfg) {
+  
+  mean_expr_for_cells <- function(seurat_obj, genes, cells) {
+    g_use <- genes[genes %in% rownames(seurat_obj)]
+    if (length(g_use) == 0 || length(cells) == 0) return(NULL)
+    expr <- as.matrix(GetAssayData(seurat_obj, assay = cfg$assay,
+                                   layer = "data")[g_use, cells, drop = FALSE])
+    if (nrow(expr) == 1) expr[1, ] else colMeans(expr)
+  }
+  
+  rows <- list()
+  
+  homeo_expr <- mean_expr_for_cells(objs$mg, genes, groups$mg_cells_homeo)
+  if (!is.null(homeo_expr)) {
+    rows[["Homeostatic"]] <- data.frame(group = "Homeostatic",
+                                        mean_exp = as.numeric(homeo_expr))
+  }
+  
+  target_expr <- mean_expr_for_cells(objs$mg, genes, groups$mg_cells_target)
+  if (!is.null(target_expr)) {
+    rows[[target_state]] <- data.frame(group = target_state,
+                                       mean_exp = as.numeric(target_expr))
+  }
+  
+  for (item in groups$other_cells_list) {
+    ct_expr <- mean_expr_for_cells(objs$merged, genes, item$cells)
+    if (!is.null(ct_expr)) {
+      rows[[item$cell_type]] <- data.frame(group = item$cell_type,
+                                           mean_exp = as.numeric(ct_expr))
+    }
+  }
+  
+  group_levels <- c("Homeostatic", target_state, groups$other_ct)
+  df <- bind_rows(rows)
+  df$group <- factor(df$group, levels = group_levels)
+  df
+}
+
+#' Build a single violin + boxplot panel for one gene set / group set.
+#'
+#' @param df Data frame from `build_expression_df()`.
+#' @param title Panel title.
+#' @param highlight_color Hex colour used for the target-state fill/title.
+#' @param group_levels Ordered group factor levels.
+#' @param target_state Name of the target disease state (relabeled on the
+#'   x-axis as "Disease State").
+#' @param show_x_labels Whether to draw x-axis tick labels (used only for the
+#'   final panel in the combined figure).
+#' @return A ggplot object.
+make_violin_panel <- function(df, title, highlight_color, group_levels,
+                              target_state, show_x_labels = FALSE) {
+  
+  n_other <- length(group_levels) - 2
+  
+  fill_colors  <- setNames(c("grey70", highlight_color, rep("grey85", n_other)),
+                           group_levels)
+  label_colors <- setNames(c("grey40", highlight_color, rep("grey40", n_other)),
+                           group_levels)
+  label_face   <- setNames(c("plain", "bold", rep("plain", n_other)),
+                           group_levels)
+  
+  x_labels <- setNames(group_levels, group_levels)
+  x_labels[target_state] <- "Disease State"
+  
+  p <- ggplot(df, aes(x = group, y = mean_exp, fill = group)) +
+    geom_violin(scale = "width", alpha = 0.85, trim = TRUE) +
+    geom_boxplot(width = 0.08, outlier.size = 0,
+                 color = "grey30", fill = "white", alpha = 0.7) +
+    scale_fill_manual(values = fill_colors, guide = "none") +
+    scale_x_discrete(labels = x_labels) +
+    labs(title = title, x = NULL, y = "Mean expression") +
+    theme_classic(base_size = 18) +
+    theme(
+      plot.title   = element_text(size = 18, face = "bold",
+                                  color = highlight_color, hjust = 0.5),
+      axis.text.y  = element_text(size = 18),
+      axis.title.y = element_text(size = 18)
+    )
+  
+  if (show_x_labels) {
+    p <- p + theme(
+      axis.text.x = element_text(size = 18, angle = 45, hjust = 1,
+                                 color = label_colors[group_levels],
+                                 face  = label_face[group_levels])
+    )
+  } else {
+    p <- p + theme(axis.text.x  = element_blank(),
+                   axis.ticks.x = element_blank())
+  }
+  
+  p
+}
+
+#' Build the ligand and receptor panels for a single pathway.
+#'
+#' @param pathway_name Name of the pathway (e.g. "FN1").
+#' @param def Pathway definition.
+#' @param objs Output of `load_and_prepare_objects()`.
+#' @param cfg Configuration list.
+#' @param show_x_on_receptors Whether the receptor panel should show x-axis
+#'   labels (true only for the last pathway in the combined figure).
+#' @return A named list with `lig` and `rec` ggplot panels (either may be
+#'   `NULL` if no cells/genes were available).
+build_pathway_panels <- function(pathway_name, def, objs, cfg,
+                                 show_x_on_receptors = FALSE) {
+  
+  target_state <- def$target_state
+  message(sprintf("Building panels: %s -> %s", pathway_name, target_state))
+  
+  groups <- build_cell_groups(def, objs, cfg)
+  message(sprintf("  Homeostatic cells: %d | Target (%s): %d",
+                  length(groups$mg_cells_homeo), target_state,
+                  length(groups$mg_cells_target)))
+  
+  group_levels <- c("Homeostatic", target_state, groups$other_ct)
+  
+  df_lig <- build_expression_df(def$ligands, groups, target_state, objs, cfg)
+  panel_lig <- if (nrow(df_lig) > 0) {
+    make_violin_panel(df_lig, title = paste("Ligands -", pathway_name),
+                      highlight_color = def$color, group_levels = group_levels,
+                      target_state = target_state, show_x_labels = FALSE)
+  } else NULL
+  
+  df_rec <- build_expression_df(def$receptors, groups, target_state, objs, cfg)
+  panel_rec <- if (nrow(df_rec) > 0) {
+    make_violin_panel(df_rec, title = paste("Receptors -", pathway_name),
+                      highlight_color = def$color, group_levels = group_levels,
+                      target_state = target_state,
+                      show_x_labels = show_x_on_receptors)
+  } else NULL
+  
+  list(lig = panel_lig, rec = panel_rec)
+}
+
+# =============================================================================
+# 3. Main
+# =============================================================================
+
+main <- function(cfg, pathway_defs) {
+  
+  dir.create(cfg$output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  objs <- load_and_prepare_objects(cfg)
+  
+  pw_names   <- names(pathway_defs)
+  n_pathways <- length(pw_names)
+  all_panels <- list()
+  
+  for (i in seq_along(pw_names)) {
+    pw  <- pw_names[[i]]
+    def <- pathway_defs[[pw]]
+    
+    panels <- build_pathway_panels(
+      pathway_name         = pw,
+      def                  = def,
+      objs                 = objs,
+      cfg                  = cfg,
+      show_x_on_receptors  = (i == n_pathways)
+    )
+    
+    if (!is.null(panels$lig)) all_panels[[paste0(pw, "_lig")]] <- panels$lig
+    if (!is.null(panels$rec)) all_panels[[paste0(pw, "_rec")]] <- panels$rec
+  }
+  
+  n_panels <- length(all_panels)
+  if (n_panels == 0) stop("No panels could be built -- check input data and pathway definitions.")
+  
+  combined <- wrap_plots(all_panels, ncol = 1, heights = rep(1, n_panels))
+  
+  max_groups  <- max(vapply(pathway_defs, function(def) 2 + length(cfg$celltype_order),
+                            numeric(1)))
+  output_path <- file.path(cfg$output_dir, cfg$output_file)
+  
+  pdf(output_path,
+      width  = max(8, max_groups * 0.5 + 3),
+      height = n_panels * 3)
+  print(combined)
+  dev.off()
+  
+  message("Saved: ", output_path)
+  invisible(combined)
+}
+
+if (sys.nframe() == 0) {
+  main(config, pathway_defs)
+}
+```
