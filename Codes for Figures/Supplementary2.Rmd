@@ -1,0 +1,194 @@
+---
+title: "Supplementary — RoE, recovery Venns, and representative-pathway diagonal"
+author: "Yu"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 6)
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(Matrix)
+  library(ggplot2); library(ComplexHeatmap); library(circlize)
+})
+```
+
+三块内容，风险不同，caption 措辞都已写在各自小节里，请照抄进正文：
+
+- **RoE**：barplot 的统计支持。但 state-injury 占用率近满格 + 每损伤一个样本，
+  所以 RoE 与 sample/batch 完全共线，**必须**和下面的 orig.ident × dataset 诊断表一起放，
+  写成「与 batch 无法分离」，不要裸写「states show injury preference」。
+- **三份 Venn**：把 VEEV 的 recover 结果推广到三损伤，配超几何 p。这是 supp 里最硬的一块。
+- **对角 diagonal**：描述性（each state's representative pathway activity），
+  **不能**写成 validation —— state 本就在这些 pathway 分数上做的 NMF，对角是构造出来的。
+
+## 0. 配置
+
+```{r config}
+obj          <- MG.recluster.obj
+state_col    <- "state_anno"
+dataset_col  <- "dataset"
+timepoint_col<- "TimePoint"
+condition_col<- "condition"
+sample_col   <- "orig.ident"
+rna_assay    <- "RNA"
+aucell_assay <- "AUCell"
+genesets     <- genesets_mouse_final
+
+padj_cut  <- 0.05
+logfc_cut <- log2(1.5)
+
+state_map <- data.frame(
+  state   = c("State3", "State4", "State5"),
+  dataset = c("OPNA",   "VEEV",   "TBI"),
+  stringsAsFactors = FALSE
+)
+
+## 代表性 pathway 表（85 modules across 5 states）——核对列名！
+rep_terms_csv   <- "MAY_parent_terms_df_MG.csv"
+rep_term_col    <- "parentTerm"   # pathway 名那一列
+rep_state_col   <- "state"        # 它代表哪个 state 那一列
+
+meta <- obj[[]]
+```
+
+## 1. 诊断表：orig.ident × dataset（RoE 的必配前提）
+
+```{r diagnostic}
+diag_tab <- table(meta[[sample_col]], meta[[dataset_col]])
+print(diag_tab)   # 预期：每个 injury ≈ 落在单个 orig.ident 上
+```
+
+## 2. RoE (Ratio of observed to expected)
+
+```{r roe, fig.height=4}
+## 观测：state × injury 细胞数；期望：卡方独立性下的期望数；RoE = O / E
+roe_obs   <- table(meta[[state_col]], meta[[dataset_col]])
+roe_chisq <- chisq.test(roe_obs)
+roe       <- as.matrix(roe_chisq$observed / roe_chisq$expected)
+
+roe_df <- as.data.frame(as.table(roe))
+colnames(roe_df) <- c("state", "injury", "RoE")
+
+roe_plot <- ggplot(roe_df, aes(injury, state, fill = RoE)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", RoE)), size = 3) +
+  scale_fill_gradient2(midpoint = 1, low = "#3B4CC0",
+                       mid = "white", high = "#B40426") +
+  labs(title = "Ro/e: state vs injury (confounded with batch — see diagnostic table)",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+roe_plot   # 先在 R 里看一眼
+
+## 存 PDF
+ggsave("./Figure_Final/SuppFig_RoE.pdf", roe_plot, width = 6, height = 5)
+```
+
+*Caption 建议*：Ro/e > 1 表示富集。因每个损伤对应单一 orig.ident 且 Harmony 未启用，
+该关联与 sample/batch 完全共线，不能解释为独立的生物学偏好。
+
+## 3. 三份 Venn + 超几何 p（leading-edge vs DEG，逐损伤）
+
+```{r venn}
+universe <- nrow(GetAssayData(obj, assay = rna_assay, layer = "data"))
+
+recover_one <- function(st, ds) {
+  base <- meta[[dataset_col]] == ds & meta[[timepoint_col]] == "Acute"
+  cells_disease <- rownames(meta)[ base & meta[[condition_col]] == "Disease" ]
+  cells_control <- rownames(meta)[ base & meta[[condition_col]] == "Control" ]
+  cells_state   <- rownames(meta)[ meta[[state_col]] == st ]
+
+  ## leading-edge（与 Figure4E 完全同定义）
+  DefaultAssay(obj) <- aucell_assay
+  obj$.pw <- NA; obj$.pw[cells_state] <- "S"; obj$.pw[cells_control] <- "C"
+  pw <- FindMarkers(obj, "S", "C", group.by = ".pw", only.pos = TRUE,
+                    logfc.threshold = logfc_cut, verbose = FALSE)
+  sig_pw <- rownames(pw)[ pw$p_val_adj <= padj_cut ]
+  pw_genes <- unique(unlist(genesets[ intersect(sig_pw, names(genesets)) ]))
+
+  DefaultAssay(obj) <- rna_assay
+  mk <- FindMarkers(obj, ident.1 = st, group.by = state_col, only.pos = TRUE,
+                    logfc.threshold = logfc_cut, verbose = FALSE)
+  mk_genes <- rownames(mk)[ mk$p_val_adj <= padj_cut ]
+  le_genes <- intersect(pw_genes, mk_genes)
+
+  ## DEG
+  obj$.dg <- NA; obj$.dg[cells_disease] <- "D"; obj$.dg[cells_control] <- "C"
+  dg <- FindMarkers(obj, "D", "C", group.by = ".dg", only.pos = TRUE,
+                    logfc.threshold = logfc_cut, verbose = FALSE)
+  deg_genes <- rownames(dg)[ dg$p_val_adj <= padj_cut ]
+
+  ov <- length(intersect(le_genes, deg_genes))
+  p_enrich <- phyper(ov - 1, length(deg_genes),
+                     universe - length(deg_genes), length(le_genes),
+                     lower.tail = FALSE)
+  list(injury = ds, leading_edge = le_genes, deg = deg_genes,
+       overlap = ov, retention = ov / max(1, length(deg_genes)),
+       p_enrich = p_enrich)
+}
+
+recov <- lapply(seq_len(nrow(state_map)), function(i)
+  recover_one(state_map$state[i], state_map$dataset[i]))
+names(recov) <- state_map$dataset
+
+## 汇总表
+recov_tab <- do.call(rbind, lapply(recov, function(r) data.frame(
+  injury = r$injury, n_LE = length(r$leading_edge), n_DEG = length(r$deg),
+  overlap = r$overlap, retention = round(r$retention, 3),
+  p_enrich = signif(r$p_enrich, 3))))
+print(recov_tab)
+```
+
+```{r venn-plot, fig.width=12, fig.height=4}
+if (requireNamespace("ggVennDiagram", quietly = TRUE)) {
+  library(ggVennDiagram); library(patchwork)
+  plots <- lapply(recov, function(r) {
+    ggVennDiagram(list(StateCommute = r$leading_edge, DEG = r$deg)) +
+      labs(title = sprintf("%s  (retention=%.2f, p=%.1e)",
+                           r$injury, r$retention, r$p_enrich)) +
+      theme(legend.position = "none")
+  })
+  venn_combined <- wrap_plots(plots, nrow = 1)
+
+  venn_combined   # 先看一眼
+
+  ## 存 PDF（三张横排，所以宽一点）
+  ggsave("./Figure_Final/SuppFig_Venn.pdf", venn_combined, width = 15, height = 5)
+
+} else {
+  message("install.packages('ggVennDiagram') 后可画三联 Venn；数值见 recov_tab")
+}
+```
+
+## 4. AUCell z-score 代表性 pathway 对角图
+
+```{r diagonal, fig.height=8}
+rep_df <- read.csv(rep_terms_csv, stringsAsFactors = FALSE)
+stopifnot(all(c(rep_term_col, rep_state_col) %in% colnames(rep_df)))
+
+auc_data <- GetAssayData(obj, assay = aucell_assay, layer = "data")
+
+## 只保留对象里存在的代表性 pathway
+rep_df <- rep_df[ rep_df[[rep_term_col]] %in% rownames(auc_data), ]
+## 按 state 排序，使对角成型
+rep_df <- rep_df[ order(factor(rep_df[[rep_state_col]])), ]
+
+## AUCell 伪 bulk（按 state）→ z-score
+pb_auc <- sapply(sort(unique(meta[[state_col]])), function(g)
+  Matrix::rowMeans(auc_data[, meta[[state_col]] == g, drop = FALSE]))
+pb_auc <- pb_auc[ rep_df[[rep_term_col]], , drop = FALSE ]
+z_auc  <- t(scale(t(pb_auc))); z_auc[is.na(z_auc)] <- 0
+
+Heatmap(
+  z_auc, name = "AUCell z",
+  col = colorRamp2(c(-2, 0, 2), c("#3B4CC0", "#FFFFFF", "#B40426")),
+  row_split = rep_df[[rep_state_col]],
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_row_names = FALSE, border = TRUE,
+  column_title = "Representative pathway activity per state (descriptive, not validation)"
+)
+```
+
+*Caption 建议*：展示各 state 代表性通路的相对活跃度。因 state 由这些通路的 AUCell
+分数经 NMF 定义、代表性通路又按 state 挑选，对角结构为构造性，属描述而非独立验证。
