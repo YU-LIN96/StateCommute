@@ -1,0 +1,717 @@
+---
+title: "Cell-cell communication: CellChat processing and figures"
+author: "Rohit"
+date: "2026-11-24"
+output: html_document
+---
+
+Full pipeline for the StateCommute cell-cell communication analysis: CellChat processing per sample
+(microglia collapsed and split by state), followed by the communication figures. Set the flags in
+the first chunk to choose what is reprocessed and replotted.
+
+## Setup
+
+```{r setup}
+options(stringsAsFactors = F)
+
+library(Seurat)
+library(CellChat)
+library(ggplot2)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(future)
+
+```
+
+## Flags
+
+```{r flags}
+REPROCESS           <- FALSE
+REPLOT_HEATMAPS     <- FALSE
+REPLOT_INTERACTION  <- FALSE
+REPLOT_CHORD        <- FALSE
+REPLOT_DIFF_HEATMAP <- FALSE
+REPLOT_CENTRALITY   <- TRUE
+```
+
+## Figures directory
+
+```{r figures-directory}
+figures_dir <- "figures"
+dir.create(figures_dir, showWarnings = FALSE)
+fig <- function(filename) file.path(figures_dir, filename)
+```
+
+## Helper functions
+
+```{r helpers}
+mg_states <- c("State1","State2","State3","State4","State5")
+
+create_cellchat_collapsed <- function(seurat_obj) {
+  cells_use <- colnames(seurat_obj)
+  meta_data  <- seurat_obj@meta.data
+  cellchat   <- createCellChat(object   = seurat_obj@assays$RNA$data[, cells_use],
+                               meta     = meta_data,
+                               group.by = "annotation3_collapsed")
+  cellchat   <- addMeta(cellchat, meta = meta_data)
+  cellchat   <- setIdent(cellchat, ident.use = "annotation3_collapsed")
+  return(cellchat)
+}
+
+create_cellchat_states <- function(seurat_obj) {
+  cells_use <- colnames(seurat_obj)
+  meta_data  <- seurat_obj@meta.data
+  cellchat   <- createCellChat(object   = seurat_obj@assays$RNA$data[, cells_use],
+                               meta     = meta_data,
+                               group.by = "annotation3")
+  cellchat   <- addMeta(cellchat, meta = meta_data)
+  cellchat   <- setIdent(cellchat, ident.use = "annotation3")
+  return(cellchat)
+}
+
+preprocess_cellchat_mouse <- function(cellchat) {
+  cellchat@DB <- CellChatDB.mouse
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat, raw.use = TRUE)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+  return(cellchat)
+}
+
+plot_signaling_heatmap <- function(cc_list,
+                                   out_pdf,
+                                   pdf_width  = 8,
+                                   pdf_height = 14) {
+  n_pairs       <- length(cc_list) / 2
+  treatment_idx <- seq(1, length(cc_list), by = 2)
+  control_idx   <- seq(2, length(cc_list), by = 2)
+  
+  pdf(out_pdf, width = pdf_width, height = pdf_height)
+  
+  for (i in seq_len(n_pairs)) {
+    trt_cc  <- cc_list[[treatment_idx[i]]]
+    ctrl_cc <- cc_list[[control_idx[i]]]
+    
+    pathway.union <- unique(c(trt_cc@netP$pathways, ctrl_cc@netP$pathways))
+    ht_height     <- max(3, length(pathway.union) * 0.4)
+    pair_labels   <- names(cc_list)[c(treatment_idx[i], control_idx[i])]
+    
+    ht_pair <- lapply(pair_labels, function(label) {
+      ht <- netAnalysis_signalingRole_heatmap(
+        cc_list[[label]],
+        pattern         = "all",
+        signaling       = pathway.union,
+        title           = label,
+        width           = 5,
+        height          = ht_height,
+        color.heatmap   = "OrRd",
+        font.size       = 12,
+        font.size.title = 12
+      )
+      ht@column_title <- label
+      return(ht)
+    })
+    
+    combined_row <- Reduce(`+`, ht_pair)
+    ComplexHeatmap::draw(
+      combined_row,
+      merge_legend = TRUE,
+      padding      = unit(c(15, 5, 15, 5), "mm")
+    )
+  }
+  
+  dev.off()
+  message("Saved: ", out_pdf)
+}
+
+filter_rare_mg_states <- function(seurat_obj, condition_name,
+                                  col       = "annotation3",
+                                  threshold = 0.05) {
+  mg_cells <- colnames(seurat_obj)[seurat_obj[[col]][,1] %in% mg_states]
+  if (length(mg_cells) == 0) return(seurat_obj)
+  mg_counts <- table(seurat_obj[[col]][mg_cells, 1])
+  mg_pct    <- mg_counts / sum(mg_counts)
+  
+  message("MG state proportions in ", condition_name, ":")
+  print(round(mg_pct * 100, 1))
+  
+  rare_states <- names(mg_pct[mg_pct < threshold])
+  if (length(rare_states) > 0) {
+    message("Removing rare states (<", threshold * 100, "%): ",
+            paste(rare_states, collapse = ", "))
+    keep_cells <- colnames(seurat_obj)[!seurat_obj[[col]][,1] %in% rare_states]
+    seurat_obj <- seurat_obj[, keep_cells]
+  } else {
+    message("No rare states to remove in ", condition_name)
+  }
+  return(seurat_obj)
+}
+```
+
+## Load data and relabel microglia states
+
+```{r data-relabelling}
+load("/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.merge.obj.final.obj.final.obj.Rdata")
+load("/projects/ecbl/DTRA/INTEGRATE/May_data/MAY.MG.recluster.obj.Rdata")
+
+set.seed(1234)
+
+mg_state_labels <- setNames(MG.recluster.obj$state_anno, colnames(MG.recluster.obj))
+shared_cells    <- intersect(colnames(merge.obj.final.obj), names(mg_state_labels))
+merge.obj.final.obj$annotation3[shared_cells] <- mg_state_labels[shared_cells]
+message("Relabeled ", length(shared_cells), " microglia cells with state annotations.")
+
+merge.obj.final.obj$annotation3_collapsed <- merge.obj.final.obj$annotation3
+mg_mask <- merge.obj.final.obj$annotation3_collapsed %in% mg_states
+merge.obj.final.obj$annotation3_collapsed[mg_mask] <- "Microglia"
+```
+
+## CellChat processing
+
+```{r processing}
+if (REPROCESS) {
+  
+  suppressWarnings(file.remove("collapsed_cellchat_processed.Rdata"))
+  suppressWarnings(file.remove("pooled_cellchat_processed.Rdata"))
+  suppressWarnings(file.remove("acute_cellchat_processed.Rdata"))
+  
+  plan(sequential)
+  
+  build_cc_collapsed <- function(orig_id, label) {
+    message("Processing collapsed: ", label, " (", orig_id, ")")
+    sub <- merge.obj.final.obj[, merge.obj.final.obj$orig.ident == orig_id]
+    sub <- filter_rare_mg_states(sub, label, col = "annotation3_collapsed")
+    cc  <- create_cellchat_collapsed(sub) %>% preprocess_cellchat_mouse()
+    return(cc)
+  }
+  
+  cc_OPNA <- list(
+    OPNA    = build_cc_collapsed("OPNA_GD_24h",     "OPNA"),
+    Control = build_cc_collapsed("OPNA_Control_24h","Control_OPNA")
+  )
+  cc_TBI <- list(
+    TBI     = build_cc_collapsed("TBI_CCI_7d",      "TBI"),
+    Control = build_cc_collapsed("TBI_Sham_7d",     "Control_TBI")
+  )
+  cc_VEEV <- list(
+    VEEV    = build_cc_collapsed("VEEV_VEEV_7d",    "VEEV"),
+    Control = build_cc_collapsed("VEEV_Mock_7d",    "Control_VEEV")
+  )
+  
+  save(cc_OPNA, cc_TBI, cc_VEEV, file = "collapsed_cellchat_processed.Rdata")
+  message("Saved: collapsed_cellchat_processed.Rdata")
+  
+  build_cc_states <- function(orig_id, label) {
+    message("Processing states: ", label, " (", orig_id, ")")
+    sub <- merge.obj.final.obj[, merge.obj.final.obj$orig.ident == orig_id]
+    sub <- filter_rare_mg_states(sub, label, col = "annotation3")
+    cc  <- create_cellchat_states(sub) %>% preprocess_cellchat_mouse()
+    return(cc)
+  }
+  
+  cc_OPNA_states <- list(
+    OPNA    = build_cc_states("OPNA_GD_24h",     "OPNA"),
+    Control = build_cc_states("OPNA_Control_24h","Control_OPNA")
+  )
+  cc_TBI_states <- list(
+    TBI     = build_cc_states("TBI_CCI_7d",      "TBI"),
+    Control = build_cc_states("TBI_Sham_7d",     "Control_TBI")
+  )
+  cc_VEEV_states <- list(
+    VEEV    = build_cc_states("VEEV_VEEV_7d",    "VEEV"),
+    Control = build_cc_states("VEEV_Mock_7d",    "Control_VEEV")
+  )
+  
+  save(cc_OPNA_states, cc_TBI_states, cc_VEEV_states,
+       file = "acute_cellchat_processed.Rdata")
+  message("Saved: acute_cellchat_processed.Rdata")
+  
+  build_pooled_states <- function(orig_ids, label) {
+    objs <- lapply(seq_along(orig_ids), function(i) {
+      sub <- merge.obj.final.obj[, merge.obj.final.obj$orig.ident == orig_ids[i]]
+      filter_rare_mg_states(sub, paste(label, i), col = "annotation3")
+    })
+    merged <- Reduce(function(a, b) merge(a, b), objs)
+    merged <- JoinLayers(merged)
+    create_cellchat_states(merged) %>% preprocess_cellchat_mouse()
+  }
+  
+  cc_pooled_states <- list(
+    Acute   = build_pooled_states(
+      c("OPNA_GD_24h",     "TBI_CCI_7d",   "VEEV_VEEV_7d"), "Acute"),
+    Control = build_pooled_states(
+      c("OPNA_Control_24h","TBI_Sham_7d",  "VEEV_Mock_7d"),  "Control")
+  )
+  
+  save(cc_pooled_states, file = "pooled_cellchat_processed.Rdata")
+  message("Saved: pooled_cellchat_processed.Rdata")
+  
+} else {
+  load("collapsed_cellchat_processed.Rdata")
+  load("acute_cellchat_processed.Rdata")
+  load("pooled_cellchat_processed.Rdata")
+}
+```
+
+## Build object lists
+
+```{r build-object-lists}
+object.list.collapsed <- list(
+  OPNA         = cc_OPNA[["OPNA"]],
+  TBI          = cc_TBI[["TBI"]],
+  VEEV         = cc_VEEV[["VEEV"]],
+  Control_OPNA = cc_OPNA[["Control"]],
+  Control_TBI  = cc_TBI[["Control"]],
+  Control_VEEV = cc_VEEV[["Control"]]
+)
+
+object.list.states <- list(
+  OPNA         = cc_OPNA_states[["OPNA"]],
+  TBI          = cc_TBI_states[["TBI"]],
+  VEEV         = cc_VEEV_states[["VEEV"]],
+  Control_OPNA = cc_OPNA_states[["Control"]],
+  Control_TBI  = cc_TBI_states[["Control"]],
+  Control_VEEV = cc_VEEV_states[["Control"]]
+)
+
+object.list.pooled <- list(
+  Acute   = cc_pooled_states[["Acute"]],
+  Control = cc_pooled_states[["Control"]]
+)
+```
+
+## FIGURE 1: signaling role heatmaps
+
+```{r figure-1-signaling-role-heatmaps}
+if (REPLOT_HEATMAPS) {
+  plot_signaling_heatmap(cc_OPNA, out_pdf = fig("Acute.OPNA.heatmap.pdf"),
+                         pdf_width = 8, pdf_height = 20)
+  plot_signaling_heatmap(cc_TBI,  out_pdf = fig("Acute.TBI.heatmap.pdf"),
+                         pdf_width = 8, pdf_height = 24)
+  plot_signaling_heatmap(cc_VEEV, out_pdf = fig("Acute.VEEV.heatmap.pdf"),
+                         pdf_width = 8, pdf_height = 27)
+}
+```
+
+## FIGURE 2: interaction bar plots
+
+```{r figure-2-interaction-bar-plots}
+if (REPLOT_INTERACTION) {
+  
+  cc_merged_collapsed <- mergeCellChat(object.list.collapsed,
+                                       add.names = names(object.list.collapsed))
+  
+  pdf(fig("Acute.Interaction.Barplots.pdf"), width = 12, height = 5)
+  
+  p1 <- compareInteractions(cc_merged_collapsed,
+                            show.legend = TRUE,
+                            group       = c(1,2,3,4,5,6),
+                            measure     = "count") +
+    labs(title = NULL, x = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.text = element_text(size = 12),
+          axis.text   = element_text(size = 12),
+          axis.title  = element_text(size = 12))
+  
+  p2 <- compareInteractions(cc_merged_collapsed,
+                            show.legend = TRUE,
+                            group       = c(1,2,3,4,5,6),
+                            measure     = "weight") +
+    labs(title = NULL, x = NULL) +
+    theme_classic(base_size = 12) +
+    theme(legend.text = element_text(size = 12),
+          axis.text   = element_text(size = 12),
+          axis.title  = element_text(size = 12))
+  
+  print(p1 + p2)
+  dev.off()
+  message("Saved: ", fig("Acute.Interaction.Barplots.pdf"))
+}
+```
+
+## FIGURE 3: chord diagrams — FN1 and CCL only
+
+```{r figure-3-chord-diagrams-fn1-and-ccl-only}
+if (REPLOT_CHORD) {
+  
+  all_mg_states <- c("State1","State2","State3","State4","State5")
+  
+  get_cells_use <- function(cc, states_keep) {
+    all_labels  <- levels(cc@idents)
+    excluded_mg <- setdiff(all_mg_states, states_keep)
+    all_labels[!all_labels %in% excluded_mg]
+  }
+  
+  chord_map <- list(
+    FN1 = list(
+      trt    = list(name = "OPNA",         cc = cc_OPNA_states[["OPNA"]]),
+      ctrl   = list(name = "Control_OPNA", cc = cc_OPNA_states[["Control"]]),
+      states = c("State1", "State2", "State3")
+    ),
+    CCL = list(
+      trt    = list(name = "VEEV",         cc = cc_VEEV_states[["VEEV"]]),
+      ctrl   = list(name = "Control_VEEV", cc = cc_VEEV_states[["Control"]]),
+      states = c("State1", "State2", "State4")
+    )
+  )
+  
+  for (pathway in names(chord_map)) {
+    
+    trt_name   <- chord_map[[pathway]][["trt"]][["name"]]
+    ctrl_name  <- chord_map[[pathway]][["ctrl"]][["name"]]
+    cc_trt     <- chord_map[[pathway]][["trt"]][["cc"]]
+    cc_ctrl    <- chord_map[[pathway]][["ctrl"]][["cc"]]
+    states_use <- chord_map[[pathway]][["states"]]
+    
+    cells_trt  <- get_cells_use(cc_trt,  states_use)
+    cells_ctrl <- get_cells_use(cc_ctrl, states_use)
+    
+    out_name <- fig(paste0("Acute.", pathway, ".chord.pdf"))
+    
+    pdf(out_name, width = 16, height = 8)
+    par(mfrow = c(1, 2), xpd = TRUE, cex = 0.9, mar = c(1, 1, 3, 1))
+    
+    tryCatch({
+      netVisual_aggregate(
+        cc_trt,
+        signaling      = pathway,
+        layout         = "chord",
+        sources.use    = cells_trt,
+        targets.use    = cells_trt,
+        remove.isolate = TRUE,
+        signaling.name = trt_name
+      )
+    }, error = function(e) {
+      message("  No interactions for ", trt_name, " / ", pathway)
+      plot.new()
+      text(0.5, 0.5, paste0(trt_name, "\nNo interactions"),
+           cex = 1.2, col = "grey40", adj = c(0.5, 0.5))
+    })
+    
+    tryCatch({
+      netVisual_aggregate(
+        cc_ctrl,
+        signaling      = pathway,
+        layout         = "chord",
+        sources.use    = cells_ctrl,
+        targets.use    = cells_ctrl,
+        remove.isolate = TRUE,
+        signaling.name = ctrl_name
+      )
+    }, error = function(e) {
+      message("  No interactions for ", ctrl_name, " / ", pathway)
+      plot.new()
+      text(0.5, 0.5, paste0(ctrl_name, "\nNo interactions"),
+           cex = 1.2, col = "grey40", adj = c(0.5, 0.5))
+    })
+    
+    dev.off()
+    message("Saved: ", out_name)
+  }
+}
+```
+
+## FIGURE 4: MG differential heatmaps side by side
+
+```{r figure-4-mg-differential-heatmaps-side-b}
+if (REPLOT_DIFF_HEATMAP) {
+  
+  extract_mg_centrality <- function(cc, condition_name, score = "outdeg") {
+    lapply(names(cc@netP$centr), function(pw) {
+      centr     <- cc@netP$centr[[pw]]
+      mg_scores <- centr[[score]][names(centr[[score]]) %in% mg_states]
+      if (length(mg_scores) == 0) return(NULL)
+      data.frame(
+        pathway   = pw,
+        condition = condition_name,
+        cell_type = names(mg_scores),
+        score     = as.numeric(mg_scores),
+        stringsAsFactors = FALSE
+      )
+    }) %>% bind_rows()
+  }
+  
+  score_df <- lapply(names(object.list.states), function(cond) {
+    out <- extract_mg_centrality(object.list.states[[cond]], cond, "outdeg")
+    ins <- extract_mg_centrality(object.list.states[[cond]], cond, "indeg")
+    bind_rows(out, ins)
+  }) %>%
+    bind_rows() %>%
+    group_by(pathway, condition, cell_type) %>%
+    summarise(total_score = sum(score), .groups = "drop")
+  
+  comparisons_trt <- list(
+    OPNA = c(treatment = "OPNA",  control = "Control_OPNA"),
+    VEEV = c(treatment = "VEEV",  control = "Control_VEEV"),
+    TBI  = c(treatment = "TBI",   control = "Control_TBI")
+  )
+  
+  diff_trt <- lapply(names(comparisons_trt), function(comp) {
+    trt  <- comparisons_trt[[comp]]["treatment"]
+    ctrl <- comparisons_trt[[comp]]["control"]
+    trt_df  <- score_df %>% filter(condition == trt)  %>%
+      rename(trt_score  = total_score) %>% select(-condition)
+    ctrl_df <- score_df %>% filter(condition == ctrl) %>%
+      rename(ctrl_score = total_score) %>% select(-condition)
+    full_join(trt_df, ctrl_df, by = c("pathway", "cell_type")) %>%
+      mutate(
+        trt_score  = ifelse(is.na(trt_score),  0, trt_score),
+        ctrl_score = ifelse(is.na(ctrl_score), 0, ctrl_score),
+        diff       = trt_score - ctrl_score,
+        comparison = comp
+      )
+  }) %>% bind_rows()
+  
+  pathway_diff_trt <- diff_trt %>%
+    group_by(pathway, comparison) %>%
+    summarise(mean_diff = mean(diff), .groups = "drop")
+  
+  pathway_rank <- pathway_diff_trt %>%
+    group_by(pathway) %>%
+    summarise(max_abs_diff = max(abs(mean_diff)), .groups = "drop") %>%
+    arrange(desc(max_abs_diff))
+  
+  write.csv(pathway_rank,
+            file = fig("Acute.MG.Pathway.Differential.Ranked.csv"),
+            row.names = FALSE)
+  write.csv(diff_trt,
+            file = fig("Acute.MG.Pathway.Differential.Full.csv"),
+            row.names = FALSE)
+  
+  top_n     <- 30
+  top_paths <- pathway_rank %>%
+    filter(max_abs_diff > 0) %>%
+    head(top_n) %>%
+    pull(pathway)
+  
+  mat_trt <- do.call(cbind, lapply(names(comparisons_trt), function(comp) {
+    sub  <- pathway_diff_trt %>% filter(comparison == comp, pathway %in% top_paths)
+    vals <- setNames(rep(0, length(top_paths)), top_paths)
+    vals[sub$pathway] <- sub$mean_diff
+    vals
+  }))
+  colnames(mat_trt) <- names(comparisons_trt)
+  rownames(mat_trt) <- top_paths
+  
+  state_control_pairs <- list(
+    State3 = "Control_OPNA",
+    State4 = "Control_VEEV",
+    State5 = "Control_TBI"
+  )
+  
+  mat_state <- do.call(cbind, lapply(names(state_control_pairs), function(st) {
+    matched_ctrl <- state_control_pairs[[st]]
+    st_all <- score_df %>%
+      filter(cell_type == st) %>%
+      group_by(pathway) %>%
+      summarise(st_score = mean(total_score), .groups = "drop")
+    ctrl_baseline <- score_df %>%
+      filter(condition == matched_ctrl) %>%
+      group_by(pathway) %>%
+      summarise(baseline = mean(total_score), .groups = "drop")
+    diff_st <- full_join(st_all, ctrl_baseline, by = "pathway") %>%
+      mutate(
+        st_score = ifelse(is.na(st_score), 0, st_score),
+        baseline = ifelse(is.na(baseline), 0, baseline),
+        diff     = st_score - baseline
+      )
+    vals <- setNames(rep(0, length(top_paths)), top_paths)
+    matched <- diff_st %>% filter(pathway %in% top_paths)
+    vals[matched$pathway] <- matched$diff
+    vals
+  }))
+  
+  colnames(mat_state) <- c("State3", "State4", "State5")
+  rownames(mat_state) <- top_paths
+  
+  abs_max <- max(abs(mat_trt), abs(mat_state))
+  
+  col_shared <- colorRamp2(c(-abs_max, 0, abs_max),
+                           c("steelblue", "white", "firebrick"))
+  
+  ht_trt <- Heatmap(
+    mat_trt,
+    name            = "Mean diff",
+    col             = col_shared,
+    cluster_rows    = TRUE,
+    cluster_columns = FALSE,
+    show_row_names  = TRUE,
+    row_names_gp    = gpar(fontsize = 12),
+    column_names_gp = gpar(fontsize = 12),
+    column_title    = "Treatment vs Control",
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    rect_gp         = gpar(col = "white", lwd = 1),
+    cell_fun        = function(j, i, x, y, width, height, fill) {
+      val <- mat_trt[i, j]
+      if (abs(val) > abs_max * 0.3) {
+        grid.text(sprintf("%.2f", val), x, y,
+                  gp = gpar(fontsize = 9,
+                            col = ifelse(abs(val) > abs_max * 0.6,
+                                         "white", "black")))
+      }
+    },
+    width  = unit(5, "cm"),
+    height = unit(top_n * 0.55, "cm")
+  )
+  
+  ht_state <- Heatmap(
+    mat_state,
+    name            = "Mean diff",
+    col             = col_shared,
+    cluster_rows    = FALSE,
+    cluster_columns = FALSE,
+    show_row_names  = TRUE,
+    row_names_gp    = gpar(fontsize = 12),
+    column_names_gp = gpar(fontsize = 12),
+    column_title    = "Activated States vs Control",
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    rect_gp         = gpar(col = "white", lwd = 1),
+    cell_fun        = function(j, i, x, y, width, height, fill) {
+      val <- mat_state[i, j]
+      if (abs(val) > abs_max * 0.3) {
+        grid.text(sprintf("%.2f", val), x, y,
+                  gp = gpar(fontsize = 9,
+                            col = ifelse(abs(val) > abs_max * 0.6,
+                                         "white", "black")))
+      }
+    },
+    width  = unit(6, "cm"),
+    height = unit(top_n * 0.55, "cm")
+  )
+  
+  pdf(fig("Acute.MG.Pathway.Differential.Heatmap.pdf"),
+      width  = 20,
+      height = max(10, top_n * 0.6))
+  draw(ht_trt + ht_state,
+       merge_legend = TRUE,
+       padding      = unit(c(10, 10, 10, 30), "mm"))
+  dev.off()
+  message("Saved: ", fig("Acute.MG.Pathway.Differential.Heatmap.pdf"))
+}
+```
+
+## FIGURE 5: centrality bar plots — FN1 and CCL
+
+```{r figure-5-centrality-bar-plots-fn1-and-cc}
+if (REPLOT_CENTRALITY) {
+  
+  extract_centr <- function(cc, cond, pathway, states_keep) {
+    if (!pathway %in% names(cc@netP$centr)) return(NULL)
+    centr <- cc@netP$centr[[pathway]]
+    mg    <- intersect(states_keep, names(centr$outdeg))
+    if (length(mg) == 0) return(NULL)
+    data.frame(
+      pathway   = pathway,
+      condition = cond,
+      cell_type = mg,
+      outdeg    = centr$outdeg[mg],
+      indeg     = centr$indeg[mg],
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  centrality_map <- list(
+    FN1 = list(
+      conditions = c("OPNA", "Control_OPNA"),
+      states     = c("State1", "State2", "State3"),
+      cc_list    = list(
+        OPNA         = cc_OPNA_states[["OPNA"]],
+        Control_OPNA = cc_OPNA_states[["Control"]]
+      )
+    ),
+    CCL = list(
+      conditions = c("VEEV", "Control_VEEV"),
+      states     = c("State1", "State2", "State4"),
+      cc_list    = list(
+        VEEV         = cc_VEEV_states[["VEEV"]],
+        Control_VEEV = cc_VEEV_states[["Control"]]
+      )
+    ),
+    ApoE = list(
+      conditions = c("TBI", "Control_TBI"),        
+      states     = c("State1", "State2", "State5"),
+      state_map  = list(
+        TBI         = c("State5"),
+        Control_TBI = c("State1", "State2")
+      ),
+      cc_list    = list(
+        TBI         = cc_TBI_states[["TBI"]],      
+        Control_TBI = cc_TBI_states[["Control"]]    
+      )
+    ),
+    SPP1 = list(
+      conditions = c("OPNA", "TBI", "VEEV",
+                     "Control_OPNA", "Control_TBI", "Control_VEEV"),  # fixed duplicate Control_TBI
+      states     = c("State1", "State2", "State3", "State4", "State5"),
+      cc_list    = list(
+        OPNA         = cc_OPNA_states[["OPNA"]],    # fixed: was all cc_VEEV_states
+        TBI          = cc_TBI_states[["TBI"]],
+        VEEV         = cc_VEEV_states[["VEEV"]],
+        Control_OPNA = cc_OPNA_states[["Control"]],
+        Control_TBI  = cc_TBI_states[["Control"]],
+        Control_VEEV = cc_VEEV_states[["Control"]]
+      )
+    )
+  )
+    
+  
+  for (pathway in names(centrality_map)) {
+    
+    conds_use  <- centrality_map[[pathway]][["conditions"]]
+    states_use <- centrality_map[[pathway]][["states"]]
+    cc_list    <- centrality_map[[pathway]][["cc_list"]]
+    
+    centr_df <- lapply(conds_use, function(cond) {
+      states_for_cond <- if (!is.null(centrality_map[[pathway]][["state_map"]])) {
+        centrality_map[[pathway]][["state_map"]][[cond]]
+      } else {
+        states_use
+      }
+      extract_centr(cc_list[[cond]], cond, pathway, states_for_cond)
+    }) %>%
+      bind_rows()
+    
+    if (nrow(centr_df) == 0) {
+      message("No centrality data for ", pathway)
+      next
+    }
+    
+    centr_df <- centr_df %>%
+      mutate(
+        total     = outdeg + indeg,
+        group     = ifelse(grepl("^Control", condition), "Control", "Disease"),
+        condition = factor(condition, levels = conds_use),
+        cell_type = factor(cell_type, levels = states_use)
+      )
+    
+    p <- ggplot(centr_df, aes(x = cell_type, y = total, fill = condition)) +
+      geom_bar(stat = "identity", position = position_dodge(width = 0.8),
+               width = 0.7) +
+      facet_wrap(~ group, scales = "free_x") +
+      scale_fill_brewer(palette = "Set2") +
+      labs(x     = NULL,
+           y     = "Total centrality (outdeg + indeg)",
+           fill  = "Condition",
+           title = pathway) +
+      theme_classic(base_size = 12) +
+      theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 12),
+            axis.text.y  = element_text(size = 12),
+            axis.title.y = element_text(size = 12),
+            strip.text   = element_text(size = 12),
+            plot.title   = element_text(size = 13),
+            legend.text  = element_text(size = 11),
+            legend.title = element_text(size = 12))
+    
+    out_pdf <- fig(paste0("Acute.CentralityBar.", pathway, ".pdf"))
+    pdf(out_pdf, width = 8, height = 5)
+    print(p)
+    dev.off()
+    message("Saved: ", out_pdf)
+  }
+}
+```
